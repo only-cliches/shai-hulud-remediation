@@ -18,7 +18,7 @@ param(
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Continue'
-$ToolVersion = '2.1.0'
+$ToolVersion = '2.2.0'
 $IocUrl = 'https://raw.githubusercontent.com/wiz-sec-public/wiz-research-iocs/refs/heads/main/reports/keyv-packages.csv'
 $Mode = if ($AuditOnly) { 'audit' } else { 'remediate' }
 $CustomScope = $null -ne $ScanRoot -and $ScanRoot.Count -gt 0
@@ -31,6 +31,11 @@ $Stats = [ordered]@{
     configs_updated = 0
     package_json_scanned = 0
     dependency_findings = 0
+    ide_hooks_scanned = 0
+    ide_hooks_found = 0
+    ide_hooks_removed = 0
+    persistence_artifacts_found = 0
+    persistence_artifacts_removed = 0
     operational_errors = 0
 }
 
@@ -114,6 +119,7 @@ $RunId = '{0}-{1}' -f ([DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ')), $PID
 $ReportFile = Join-Path $ReportDirectory "Shai-Hulud-Remediation-$RunId.log"
 $SummaryFile = Join-Path $ReportDirectory "Shai-Hulud-Remediation-$RunId.json"
 $FindingsFile = Join-Path $ReportDirectory "Shai-Hulud-Dependencies-$RunId.csv"
+$PersistenceFile = Join-Path $ReportDirectory "Shai-Hulud-Persistence-$RunId.csv"
 $UsingDefaultBackupDirectory = [string]::IsNullOrWhiteSpace($BackupDirectory)
 if ($UsingDefaultBackupDirectory) {
     $backupStateRoot = if ($IsAdministrator) { $env:ProgramData } elseif (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) { $env:LOCALAPPDATA } else { [IO.Path]::GetTempPath() }
@@ -122,6 +128,8 @@ if ($UsingDefaultBackupDirectory) {
 $ConfigBackupDirectory = Join-Path $BackupDirectory $RunId
 $ConfigBackupManifest = Join-Path $ConfigBackupDirectory "manifest.tsv"
 $ConfigBackupSequence = 0
+$IdeConfigFiles = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+$PersistenceEvents = New-Object 'System.Collections.Generic.List[object]'
 $WorkingDirectory = Join-Path ([IO.Path]::GetTempPath()) "shai-hulud-$([Guid]::NewGuid().ToString('N'))"
 try {
     [void][IO.Directory]::CreateDirectory($WorkingDirectory)
@@ -150,6 +158,59 @@ function Add-OperationalError {
     param([string]$Message)
     $script:Stats.operational_errors++
     Write-Log 'ERROR' $Message
+}
+
+function Add-PersistenceEvent {
+    param(
+        [string]$File,
+        [string]$Kind,
+        [string]$Event,
+        [string]$Command,
+        [string]$Action
+    )
+    $script:PersistenceEvents.Add([PSCustomObject][ordered]@{
+        File = $File
+        Kind = $Kind
+        Event = $Event
+        Command = $Command
+        Action = $Action
+    })
+}
+
+function Remove-MaliciousArtifact {
+    param([string]$Path)
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    } catch { return }
+
+    $isReparsePoint = ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+    $isKnownDirectory = $item.PSIsContainer -and $item.Name -like 'bun-dl-*'
+    $isKnownFile = -not $item.PSIsContainer -and @('Math_Symbol.js', 'math_init.js', 'setup.mjs') -contains $item.Name
+    if (-not $isKnownDirectory -and -not $isKnownFile) {
+        Add-OperationalError "Safety check rejected unexpected persistence target '$Path'"
+        return
+    }
+
+    $script:Stats.persistence_artifacts_found++
+    if ($script:Mode -eq 'audit') {
+        Add-PersistenceEvent $Path 'payload' '' '' 'would-remove'
+        Write-Log 'AUDIT' "Would remove malicious artifact: $Path"
+        return
+    }
+    try {
+        if ($item.PSIsContainer -and -not $isReparsePoint) {
+            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+        } else {
+            Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+        }
+        if (Test-Path -LiteralPath $Path) { throw 'Target still exists after removal' }
+        $script:Stats.persistence_artifacts_removed++
+        Add-PersistenceEvent $Path 'payload' '' '' 'removed'
+        Write-Log 'INFO' "Removed malicious artifact: $Path"
+    } catch {
+        Add-PersistenceEvent $Path 'payload' '' '' 'remove-failed'
+        Add-OperationalError "Failed to remove malicious artifact '$Path': $($_.Exception.Message)"
+    }
 }
 
 function Remove-RemediationDirectory {
@@ -250,6 +311,22 @@ function Get-TreeInventory {
             $current = $stack.Pop()
             $manifest = Join-Path $current 'package.json'
             if ([IO.File]::Exists($manifest)) { $manifests.Add($manifest) }
+            $currentLeaf = Split-Path -Leaf $current
+            $ideConfig = $null
+            if ($currentLeaf -ieq '.claude') { $ideConfig = Join-Path $current 'settings.json' }
+            elseif ($currentLeaf -ieq '.vscode') { $ideConfig = Join-Path $current 'tasks.json' }
+            if ($null -ne $ideConfig -and [IO.File]::Exists($ideConfig)) {
+                try {
+                    $configItem = Get-Item -LiteralPath $ideConfig -Force -ErrorAction Stop
+                    if (($configItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -and -not $configItem.PSIsContainer) {
+                        [void]$script:IdeConfigFiles.Add($configItem.FullName)
+                    }
+                } catch { Add-OperationalError "Could not inspect IDE persistence config '$ideConfig': $($_.Exception.Message)" }
+            }
+            foreach ($payloadName in @('Math_Symbol.js', 'math_init.js')) {
+                $payloadPath = Join-Path $current $payloadName
+                if ([IO.File]::Exists($payloadPath)) { Remove-MaliciousArtifact $payloadPath }
+            }
             try {
                 foreach ($directoryPath in [IO.Directory]::EnumerateDirectories($current)) {
                     $directory = New-Object IO.DirectoryInfo($directoryPath)
@@ -263,6 +340,10 @@ function Get-TreeInventory {
                         continue
                     }
                     if (($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+                    if ($directory.Name -like 'bun-dl-*') {
+                        Remove-MaliciousArtifact $directory.FullName
+                        continue
+                    }
                     $stack.Push($directory.FullName)
                 }
             } catch [System.UnauthorizedAccessException] {
@@ -565,6 +646,153 @@ function Verify-PackageManagerControls {
     foreach ($projectDirectory in $projectDirectories) { Verify-ConfigDirectory $projectDirectory 'project' }
 }
 
+function Add-SetupPayloadReference {
+    param(
+        [string]$ConfigPath,
+        [string]$Command,
+        [System.Collections.Generic.HashSet[string]]$References
+    )
+    $match = [regex]::Match($Command, '(?i)(?<reference>[^\s`"''|&;<>()]*setup\.mjs)')
+    if (-not $match.Success) { return }
+    $reference = $match.Groups['reference'].Value
+    $configDirectory = Split-Path -Parent $ConfigPath
+    $candidates = New-Object 'System.Collections.Generic.List[string]'
+    if ([IO.Path]::IsPathRooted($reference)) {
+        $candidates.Add($reference)
+    } else {
+        $candidates.Add((Join-Path $configDirectory ([IO.Path]::GetFileName($reference))))
+        $candidates.Add((Join-Path $configDirectory $reference))
+        $candidates.Add((Join-Path (Split-Path -Parent $configDirectory) ([IO.Path]::GetFileName($reference))))
+    }
+    foreach ($candidate in $candidates) {
+        try {
+            $fullPath = [IO.Path]::GetFullPath($candidate)
+            $item = Get-Item -LiteralPath $fullPath -Force -ErrorAction Stop
+            if (-not $item.PSIsContainer -and $item.Name -ieq 'setup.mjs') { [void]$References.Add($item.FullName) }
+        } catch [System.Management.Automation.ItemNotFoundException] {
+            continue
+        } catch {
+            Add-OperationalError "Could not inspect referenced setup.mjs '$candidate': $($_.Exception.Message)"
+        }
+    }
+}
+
+function Remove-IdePersistence {
+    param([string[]]$ConfigFiles)
+    $payloadPattern = '(?i)(setup\.mjs|Math_Symbol(?:\.js)?|math_init(?:\.js)?|bun-dl-)'
+    $payloadReferences = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+
+    foreach ($configPath in @($ConfigFiles | Select-Object -Unique)) {
+        $script:Stats.ide_hooks_scanned++
+        try {
+            $item = Get-Item -LiteralPath $configPath -Force -ErrorAction Stop
+            if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'not a regular, non-reparse-point file' }
+            $data = Get-Content -LiteralPath $configPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            if ($null -eq $data -or $data -is [Array] -or -not ($data -is [PSCustomObject])) { throw 'not a JSON object' }
+        } catch {
+            Add-PersistenceEvent $configPath 'error' '' $_.Exception.Message 'skipped'
+            Add-OperationalError "Could not safely parse IDE persistence config '$configPath': $($_.Exception.Message)"
+            continue
+        }
+
+        $configFindings = New-Object 'System.Collections.Generic.List[object]'
+        if ((Split-Path -Leaf $configPath) -ieq 'settings.json' -and (Split-Path -Leaf (Split-Path -Parent $configPath)) -ieq '.claude') {
+            $hooksProperty = $data.PSObject.Properties['hooks']
+            if ($null -ne $hooksProperty -and $hooksProperty.Value -is [PSCustomObject]) {
+                $hooks = $hooksProperty.Value
+                foreach ($eventProperty in @($hooks.PSObject.Properties)) {
+                    if (-not ($eventProperty.Value -is [Array])) { continue }
+                    $keptEntries = New-Object 'System.Collections.Generic.List[object]'
+                    foreach ($entry in $eventProperty.Value) {
+                        if ($null -eq $entry -or -not ($entry -is [PSCustomObject])) { $keptEntries.Add($entry); continue }
+                        $entryHooksProperty = $entry.PSObject.Properties['hooks']
+                        if ($null -eq $entryHooksProperty -or -not ($entryHooksProperty.Value -is [Array])) { $keptEntries.Add($entry); continue }
+                        $keptHooks = New-Object 'System.Collections.Generic.List[object]'
+                        foreach ($hook in $entryHooksProperty.Value) {
+                            $command = ''
+                            if ($null -ne $hook -and $hook -is [PSCustomObject]) {
+                                $commandProperty = $hook.PSObject.Properties['command']
+                                if ($null -ne $commandProperty) { $command = [string]$commandProperty.Value }
+                            }
+                            if ($command -match $payloadPattern) {
+                                Add-SetupPayloadReference $configPath $command $payloadReferences
+                                $configFindings.Add([PSCustomObject]@{ File = $configPath; Kind = 'claude-hook'; Event = $eventProperty.Name; Command = $command })
+                            } else {
+                                $keptHooks.Add($hook)
+                            }
+                        }
+                        if ($keptHooks.Count -gt 0) {
+                            $entryHooksProperty.Value = @($keptHooks | ForEach-Object { $_ })
+                            $keptEntries.Add($entry)
+                        }
+                    }
+                    if ($keptEntries.Count -gt 0) {
+                        $eventProperty.Value = @($keptEntries | ForEach-Object { $_ })
+                    } else {
+                        $hooks.PSObject.Properties.Remove($eventProperty.Name)
+                    }
+                }
+                if ($hooks.PSObject.Properties.Count -eq 0) { $data.PSObject.Properties.Remove('hooks') }
+            }
+        } elseif ((Split-Path -Leaf $configPath) -ieq 'tasks.json' -and (Split-Path -Leaf (Split-Path -Parent $configPath)) -ieq '.vscode') {
+            $tasksProperty = $data.PSObject.Properties['tasks']
+            if ($null -ne $tasksProperty -and $tasksProperty.Value -is [Array]) {
+                $keptTasks = New-Object 'System.Collections.Generic.List[object]'
+                foreach ($task in $tasksProperty.Value) {
+                    if ($null -eq $task -or -not ($task -is [PSCustomObject])) { $keptTasks.Add($task); continue }
+                    $blob = $task | ConvertTo-Json -Depth 100 -Compress
+                    if ($blob -match $payloadPattern) {
+                        Add-SetupPayloadReference $configPath $blob $payloadReferences
+                        $command = ''
+                        $commandProperty = $task.PSObject.Properties['command']
+                        if ($null -ne $commandProperty) { $command = [string]$commandProperty.Value }
+                        if ([string]::IsNullOrWhiteSpace($command)) {
+                            $argsProperty = $task.PSObject.Properties['args']
+                            if ($null -ne $argsProperty -and $argsProperty.Value -is [Array]) { $command = [string]::Join(' ', [string[]]$argsProperty.Value) }
+                        }
+                        $labelProperty = $task.PSObject.Properties['label']
+                        $label = if ($null -ne $labelProperty) { [string]$labelProperty.Value } else { '' }
+                        if ([string]::IsNullOrWhiteSpace($command)) { $command = $label }
+                        $event = $label
+                        $runOptionsProperty = $task.PSObject.Properties['runOptions']
+                        if ($null -ne $runOptionsProperty -and $runOptionsProperty.Value -is [PSCustomObject]) {
+                            $runOnProperty = $runOptionsProperty.Value.PSObject.Properties['runOn']
+                            if ($null -ne $runOnProperty -and -not [string]::IsNullOrWhiteSpace([string]$runOnProperty.Value)) { $event = [string]$runOnProperty.Value }
+                        }
+                        $configFindings.Add([PSCustomObject]@{ File = $configPath; Kind = 'vscode-task'; Event = $event; Command = $command })
+                    } else {
+                        $keptTasks.Add($task)
+                    }
+                }
+                if ($keptTasks.Count -ne $tasksProperty.Value.Count) { $tasksProperty.Value = @($keptTasks | ForEach-Object { $_ }) }
+            }
+        }
+
+        if ($configFindings.Count -eq 0) { continue }
+        $script:Stats.ide_hooks_found += $configFindings.Count
+        if ($script:Mode -eq 'audit') {
+            foreach ($finding in $configFindings) { Add-PersistenceEvent $finding.File $finding.Kind $finding.Event $finding.Command 'would-remove' }
+            continue
+        }
+        if (-not (Backup-ConfigFile $configPath)) {
+            foreach ($finding in $configFindings) { Add-PersistenceEvent $finding.File $finding.Kind $finding.Event $finding.Command 'rewrite-failed' }
+            continue
+        }
+        try {
+            $json = $data | ConvertTo-Json -Depth 100
+            Write-AtomicTextFile $configPath @($json)
+            $script:Stats.ide_hooks_removed += $configFindings.Count
+            foreach ($finding in $configFindings) { Add-PersistenceEvent $finding.File $finding.Kind $finding.Event $finding.Command 'removed' }
+            Write-Log 'INFO' "Removed malicious IDE persistence entries from: $configPath"
+        } catch {
+            foreach ($finding in $configFindings) { Add-PersistenceEvent $finding.File $finding.Kind $finding.Event $finding.Command 'rewrite-failed' }
+            Add-OperationalError "Failed to update IDE config '$configPath': $($_.Exception.Message)"
+        }
+    }
+
+    foreach ($payloadReference in $payloadReferences) { Remove-MaliciousArtifact $payloadReference }
+}
+
 function Get-IocRows {
     if (-not [string]::IsNullOrWhiteSpace($script:IocFile)) {
         if (-not [IO.File]::Exists($script:IocFile)) { Add-OperationalError "IOC file does not exist: $($script:IocFile)"; return @() }
@@ -594,13 +822,14 @@ function Find-VulnerableDeclarations {
         $script:Stats.package_json_scanned++
         try {
             $manifest = Get-Content -LiteralPath $manifestPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            if ($null -eq $manifest -or $manifest -is [Array] -or -not ($manifest -is [PSCustomObject])) { throw 'manifest is not a JSON object' }
         } catch {
             Add-OperationalError "Could not parse package manifest '$manifestPath': $($_.Exception.Message)"
             continue
         }
         foreach ($section in @('dependencies','devDependencies','optionalDependencies','peerDependencies')) {
             $property = $manifest.PSObject.Properties[$section]
-            if ($null -eq $property -or $null -eq $property.Value) { continue }
+            if ($null -eq $property -or $null -eq $property.Value -or $property.Value -is [Array] -or -not ($property.Value -is [PSCustomObject])) { continue }
             foreach ($dependency in $property.Value.PSObject.Properties) {
                 if (-not $iocMap.ContainsKey($dependency.Name)) { continue }
                 $declared = [string]$dependency.Value
@@ -647,6 +876,23 @@ function Export-DependencyFindings {
     } | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8 -Force -ErrorAction Stop
 }
 
+function Export-PersistenceEvents {
+    param([object[]]$Events, [string]$Path)
+    if ($Events.Count -eq 0) {
+        [IO.File]::WriteAllText($Path, '"File","Kind","Event","Command","Action"' + [Environment]::NewLine, (New-Object Text.UTF8Encoding($false)))
+        return
+    }
+    $Events | ForEach-Object {
+        [PSCustomObject][ordered]@{
+            File = ConvertTo-CsvSafeValue $_.File
+            Kind = ConvertTo-CsvSafeValue $_.Kind
+            Event = ConvertTo-CsvSafeValue $_.Event
+            Command = ConvertTo-CsvSafeValue $_.Command
+            Action = ConvertTo-CsvSafeValue $_.Action
+        }
+    } | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8 -Force -ErrorAction Stop
+}
+
 try {
     Write-Log 'INFO' "Shai Hulud remediation v$ToolVersion started (mode=$Mode, host=$env:COMPUTERNAME, user=$env:USERNAME)"
     Write-Log 'INFO' "Report: $ReportFile"
@@ -663,6 +909,7 @@ try {
             Remove-KnownCaches $Profiles
             Protect-LifecycleScripts $Profiles $Manifests
             Verify-PackageManagerControls $Profiles $Manifests
+            Remove-IdePersistence @($IdeConfigFiles)
             $Findings = @(Find-VulnerableDeclarations $Manifests $IocRows)
         }
     } else {
@@ -672,15 +919,19 @@ try {
         Export-DependencyFindings $Findings $FindingsFile
         Write-Log 'INFO' "Dependency report: $FindingsFile"
     } catch { Add-OperationalError "Could not publish dependency report: $($_.Exception.Message)" }
+    try {
+        Export-PersistenceEvents @($PersistenceEvents) $PersistenceFile
+        Write-Log 'INFO' "Persistence report: $PersistenceFile"
+    } catch { Add-OperationalError "Could not publish persistence report: $($_.Exception.Message)" }
 } catch {
     Add-OperationalError "Unhandled remediation error: $($_.Exception.Message)"
 }
 
-$AuditWork = $Stats.node_modules_found + $Stats.caches_found + $Stats.configs_needing_change
+$AuditWork = $Stats.node_modules_found + $Stats.caches_found + $Stats.configs_needing_change + $Stats.persistence_artifacts_found + $Stats.ide_hooks_found
 $ExitCode = 0
 $Status = 'completed'
 if ($Stats.operational_errors -gt 0) { $ExitCode = 20; $Status = 'completed_with_errors' }
-elseif ($Stats.dependency_findings -gt 0 -or ($Mode -eq 'audit' -and $AuditWork -gt 0)) { $ExitCode = 10; $Status = 'attention_required' }
+elseif ($Stats.dependency_findings -gt 0 -or $Stats.persistence_artifacts_found -gt 0 -or $Stats.ide_hooks_found -gt 0 -or ($Mode -eq 'audit' -and $AuditWork -gt 0)) { $ExitCode = 10; $Status = 'attention_required' }
 
 $summary = [ordered]@{
     schema_version = 1
@@ -699,7 +950,7 @@ try {
     $Status = 'completed_with_errors'
 }
 
-Write-Log 'SUMMARY' "status=$Status exit_code=$ExitCode node_modules_found=$($Stats.node_modules_found) node_modules_removed=$($Stats.node_modules_removed) caches_found=$($Stats.caches_found) caches_removed=$($Stats.caches_removed) configs_needed=$($Stats.configs_needing_change) configs_updated=$($Stats.configs_updated) manifests_scanned=$($Stats.package_json_scanned) dependency_findings=$($Stats.dependency_findings) errors=$($Stats.operational_errors)"
+Write-Log 'SUMMARY' "status=$Status exit_code=$ExitCode node_modules_found=$($Stats.node_modules_found) node_modules_removed=$($Stats.node_modules_removed) caches_found=$($Stats.caches_found) caches_removed=$($Stats.caches_removed) configs_needed=$($Stats.configs_needing_change) configs_updated=$($Stats.configs_updated) manifests_scanned=$($Stats.package_json_scanned) dependency_findings=$($Stats.dependency_findings) ide_hooks_scanned=$($Stats.ide_hooks_scanned) ide_hooks_found=$($Stats.ide_hooks_found) ide_hooks_removed=$($Stats.ide_hooks_removed) persistence_found=$($Stats.persistence_artifacts_found) persistence_removed=$($Stats.persistence_artifacts_removed) errors=$($Stats.operational_errors)"
 if ([IO.File]::Exists($SummaryFile)) { Write-Log 'INFO' "Machine-readable summary: $SummaryFile" }
 try { Remove-Item -LiteralPath $WorkingDirectory -Recurse -Force -ErrorAction SilentlyContinue } catch {}
 exit $ExitCode

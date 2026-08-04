@@ -172,6 +172,7 @@ RUN_ID="$(date -u '+%Y%m%dT%H%M%SZ')-$$"
 REPORT_FILE="$REPORT_DIR/Shai-Hulud-Remediation-$RUN_ID.log"
 SUMMARY_FILE="$REPORT_DIR/Shai-Hulud-Remediation-$RUN_ID.json"
 FINAL_FINDINGS_FILE="$REPORT_DIR/Shai-Hulud-Dependencies-$RUN_ID.csv"
+FINAL_PERSISTENCE_FILE="$REPORT_DIR/Shai-Hulud-Persistence-$RUN_ID.csv"
 if [ -n "$BACKUP_DIR" ]; then
   CONFIG_BACKUP_DIR="$BACKUP_DIR/$RUN_ID"
 elif [ "$(id -u)" -eq 0 ]; then

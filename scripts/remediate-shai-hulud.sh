@@ -6,7 +6,7 @@ set -u
 set -o pipefail
 umask 077
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 IOC_URL="https://raw.githubusercontent.com/wiz-sec-public/wiz-research-iocs/refs/heads/main/reports/keyv-packages.csv"
 MODE="remediate"
 IOC_FILE=""
@@ -70,12 +70,17 @@ HOOKS_FILE="$WORK_DIR/hooks.bin"
 PERSISTENCE_CSV="$WORK_DIR/persistence.csv"
 PAYLOAD_REFS_FILE="$WORK_DIR/payload-refs.bin"
 HOOK_METADATA="$WORK_DIR/hook-metadata.json"
+HOOK_TRANSFORMS_FILE="$WORK_DIR/hook-transforms.bin"
+HOOK_STAGE_DIR="$WORK_DIR/hook-staged"
+PERSISTENCE_ARTIFACTS_FILE="$WORK_DIR/persistence-artifacts.bin"
 : > "$ROOTS_FILE"
 : > "$HOMES_FILE"
 : > "$PACKAGES_FILE"
 : > "$FIND_ERRORS"
 : > "$HOOKS_FILE"
 : > "$PAYLOAD_REFS_FILE"
+: > "$HOOK_TRANSFORMS_FILE"
+: > "$PERSISTENCE_ARTIFACTS_FILE"
 
 cleanup() {
   rm -rf -- "$WORK_DIR"
@@ -172,6 +177,7 @@ RUN_ID="$(date -u '+%Y%m%dT%H%M%SZ')-$$"
 REPORT_FILE="$REPORT_DIR/Shai-Hulud-Remediation-$RUN_ID.log"
 SUMMARY_FILE="$REPORT_DIR/Shai-Hulud-Remediation-$RUN_ID.json"
 FINAL_FINDINGS_FILE="$REPORT_DIR/Shai-Hulud-Dependencies-$RUN_ID.csv"
+FINAL_PERSISTENCE_FILE="$REPORT_DIR/Shai-Hulud-Persistence-$RUN_ID.csv"
 if [ -n "$BACKUP_DIR" ]; then
   CONFIG_BACKUP_DIR="$BACKUP_DIR/$RUN_ID"
 elif [ "$(id -u)" -eq 0 ]; then
@@ -274,6 +280,9 @@ remove_directory() {
 
   if [ "$MODE" = "audit" ]; then
     log "AUDIT" "Would remove $kind: $target"
+    if [ "$kind" = "malicious artifact" ]; then
+      printf '%s\0%s\0' "$target" "would-remove" >> "$PERSISTENCE_ARTIFACTS_FILE"
+    fi
     return
   fi
 
@@ -285,8 +294,14 @@ remove_directory() {
     else
       CACHES_REMOVED=$((CACHES_REMOVED + 1))
     fi
+    if [ "$kind" = "malicious artifact" ]; then
+      printf '%s\0%s\0' "$target" "removed" >> "$PERSISTENCE_ARTIFACTS_FILE"
+    fi
     log "INFO" "Removed $kind: $target"
   else
+    if [ "$kind" = "malicious artifact" ]; then
+      printf '%s\0%s\0' "$target" "remove-failed" >> "$PERSISTENCE_ARTIFACTS_FILE"
+    fi
     record_error "Failed to remove $kind: $target"
   fi
 }
@@ -833,6 +848,478 @@ JS
   fi
 }
 
+append_persistence_rows() {
+  local rows_file
+  rows_file="$1"
+  if ! cat -- "$rows_file" >> "$PERSISTENCE_CSV"; then
+    record_error "Could not append IDE persistence report rows: $rows_file"
+    return 1
+  fi
+}
+
+append_persistence_artifact_rows() {
+  local parser
+  parser="$1"
+  [ -s "$PERSISTENCE_ARTIFACTS_FILE" ] || return
+  if [ "$parser" = "python3" ]; then
+    if ! python3 - "$PERSISTENCE_ARTIFACTS_FILE" "$PERSISTENCE_CSV" <<'PY'
+import csv
+import os
+import sys
+
+events_path, output_path = sys.argv[1:]
+with open(events_path, "rb") as handle:
+    values = [os.fsdecode(value) for value in handle.read().split(b"\0") if value]
+
+def csv_safe(value):
+    text = str(value)
+    return "'" + text if text.lstrip(" \t\r\n").startswith(("=", "+", "-", "@")) else text
+
+with open(output_path, "a", newline="", encoding="utf-8") as handle:
+    writer = csv.writer(handle)
+    for index in range(0, len(values) - 1, 2):
+        writer.writerow(tuple(csv_safe(value) for value in (values[index], "payload", "", "", values[index + 1])))
+PY
+    then
+      record_error "Could not append malicious artifact rows to the persistence report"
+    fi
+  else
+    if ! node - "$PERSISTENCE_ARTIFACTS_FILE" "$PERSISTENCE_CSV" <<'JS'
+const fs = require('fs');
+const [eventsPath, outputPath] = process.argv.slice(2);
+const values = fs.readFileSync(eventsPath).toString('utf8').split('\0').filter(Boolean);
+
+function csvField(value) {
+  let text = String(value);
+  if (/^[\t\r ]*[=+\-@]/.test(text)) text = `'${text}`;
+  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+const rows = [];
+for (let index = 0; index + 1 < values.length; index += 2) {
+  rows.push([values[index], 'payload', '', '', values[index + 1]].map(csvField).join(','));
+}
+if (rows.length) fs.appendFileSync(outputPath, rows.join('\n') + '\n', 'utf8');
+JS
+    then
+      record_error "Could not append malicious artifact rows to the persistence report"
+    fi
+  fi
+}
+
+scan_ide_persistence() {
+  local root hook_file payload_file payload_dir payload_ref parser
+  local hook_path staged_file removed_rows audit_rows failed_rows hook_count
+  local hook_dir hook_tmp hook_error_count
+
+  printf 'File,Kind,Event,Command,Action\n' > "$PERSISTENCE_CSV"
+  mkdir -p -m 700 -- "$HOOK_STAGE_DIR" || { record_error "Could not create the private IDE scanner staging directory"; return; }
+
+  parser=""
+  if [ "${SHAI_HULUD_MANIFEST_PARSER:-auto}" = "node" ] && command -v node >/dev/null 2>&1; then
+    parser="node"
+  elif [ "${SHAI_HULUD_MANIFEST_PARSER:-auto}" = "python3" ] && command -v python3 >/dev/null 2>&1; then
+    parser="python3"
+  elif [ "${SHAI_HULUD_MANIFEST_PARSER:-auto}" = "auto" ]; then
+    command -v python3 >/dev/null 2>&1 && parser="python3"
+    if [ -z "$parser" ] && command -v node >/dev/null 2>&1; then parser="node"; fi
+  fi
+  if [ -z "$parser" ]; then
+    record_error "python3 or node is required for IDE persistence scanning on macOS/Linux"
+    return
+  fi
+
+  # Collect IDE configuration files and remove only the incident's known
+  # payload basenames. setup.mjs is removed only when referenced by a matched
+  # malicious hook or task.
+  while IFS= read -r root; do
+    [ -d "$root" ] || { record_error "Persistence scan root is no longer available: $root"; continue; }
+
+    while IFS= read -r -d '' hook_file; do
+      printf '%s\0' "$hook_file" >> "$HOOKS_FILE"
+    done < <(find "$root" -xdev -type d -name node_modules -prune -o -type f \( -path '*/.claude/settings.json' -o -path '*/.vscode/tasks.json' \) -print0 2>> "$FIND_ERRORS")
+
+    while IFS= read -r -d '' payload_file; do
+      remove_directory "$payload_file" "malicious artifact"
+    done < <(find "$root" -xdev -type d -name node_modules -prune -o -type f \( -name 'Math_Symbol.js' -o -name 'math_init.js' \) -print0 2>> "$FIND_ERRORS")
+
+    while IFS= read -r -d '' payload_dir; do
+      remove_directory "$payload_dir" "malicious artifact"
+    done < <(find "$root" -xdev -type d -name 'bun-dl-*' -prune -print0 2>> "$FIND_ERRORS")
+  done < "$ROOTS_FILE"
+
+  if [ ! -s "$HOOKS_FILE" ]; then
+    append_persistence_artifact_rows "$parser"
+    return
+  fi
+
+  if [ "$parser" = "python3" ]; then
+    if ! python3 - "$HOOKS_FILE" "$PERSISTENCE_CSV" "$PAYLOAD_REFS_FILE" "$HOOK_METADATA" "$HOOK_TRANSFORMS_FILE" "$HOOK_STAGE_DIR" <<'PY'
+import csv
+import json
+import os
+import re
+import stat
+import sys
+
+hooks_path, output_path, refs_path, metadata_path, transforms_path, stage_dir = sys.argv[1:]
+payload = re.compile(r"(setup\.mjs|Math_Symbol(\.js)?|math_init(\.js)?|bun-dl-)", re.IGNORECASE)
+
+with open(hooks_path, "rb") as handle:
+    discovered_paths = [os.fsdecode(item) for item in handle.read().split(b"\0") if item]
+paths = list(dict.fromkeys(discovered_paths))
+
+errors = []
+error_rows = []
+payload_refs = []
+transforms = []
+hooks_found = 0
+
+def csv_safe(value):
+    text = str(value)
+    return "'" + text if text.lstrip(" \t\r\n").startswith(("=", "+", "-", "@")) else text
+
+def write_rows(path, rows, action):
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        for row in rows:
+            writer.writerow(tuple(csv_safe(value) for value in (*row, action)))
+
+def collect_setup_refs(config_path, command):
+    lowered = command.lower()
+    index = lowered.find("setup.mjs")
+    if index == -1:
+        return
+    start = index
+    while start > 0 and command[start - 1] not in " \t\r\n\"'`&;|<>()":
+        start -= 1
+    ref = command[start:index + len("setup.mjs")]
+    directory = os.path.dirname(config_path)
+    if os.path.isabs(ref):
+        candidates = [ref]
+    else:
+        candidates = [
+            os.path.join(directory, os.path.basename(ref)),
+            os.path.join(directory, ref),
+            os.path.join(os.path.dirname(directory), os.path.basename(ref)),
+        ]
+    for candidate in candidates:
+        if (os.path.isfile(candidate) or os.path.islink(candidate)) and candidate not in payload_refs:
+            payload_refs.append(candidate)
+
+for config_path in paths:
+    try:
+        item = os.lstat(config_path)
+        if stat.S_ISLNK(item.st_mode) or not stat.S_ISREG(item.st_mode):
+            raise ValueError("not a regular, non-symlinked file")
+        with open(config_path, encoding="utf-8-sig") as handle:
+            data = json.load(handle)
+        if not isinstance(data, dict):
+            raise ValueError("not a JSON object")
+    except Exception as exc:
+        errors.append((config_path, str(exc)))
+        error_rows.append((config_path, "error", "", str(exc), "skipped"))
+        continue
+
+    config_rows = []
+    if config_path.endswith("/.claude/settings.json"):
+        hooks = data.get("hooks")
+        if isinstance(hooks, dict):
+            for event, entries in list(hooks.items()):
+                if not isinstance(entries, list):
+                    continue
+                kept_entries = []
+                for entry in entries:
+                    if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):
+                        kept_entries.append(entry)
+                        continue
+                    kept_hooks = []
+                    for hook in entry["hooks"]:
+                        command = str(hook.get("command", "")) if isinstance(hook, dict) else ""
+                        if payload.search(command):
+                            collect_setup_refs(config_path, command)
+                            config_rows.append((config_path, "claude-hook", event, command))
+                        else:
+                            kept_hooks.append(hook)
+                    if kept_hooks:
+                        entry["hooks"] = kept_hooks
+                        kept_entries.append(entry)
+                if kept_entries:
+                    hooks[event] = kept_entries
+                else:
+                    del hooks[event]
+            if not hooks:
+                del data["hooks"]
+    elif config_path.endswith("/.vscode/tasks.json"):
+        tasks = data.get("tasks")
+        if isinstance(tasks, list):
+            kept_tasks = []
+            for task in tasks:
+                if not isinstance(task, dict):
+                    kept_tasks.append(task)
+                    continue
+                blob = json.dumps(task)
+                if payload.search(blob):
+                    collect_setup_refs(config_path, blob)
+                    command = str(task.get("command") or " ".join(str(arg) for arg in (task.get("args") or [])) or task.get("label") or "")
+                    run_options = task.get("runOptions")
+                    event = str(run_options.get("runOn", "")) if isinstance(run_options, dict) else ""
+                    config_rows.append((config_path, "vscode-task", event or str(task.get("label", "")), command))
+                else:
+                    kept_tasks.append(task)
+            if len(kept_tasks) != len(tasks):
+                data["tasks"] = kept_tasks
+
+    if not config_rows:
+        continue
+
+    hooks_found += len(config_rows)
+    index = len(transforms)
+    staged = os.path.join(stage_dir, f"{index:06d}.json")
+    removed_rows = os.path.join(stage_dir, f"{index:06d}.removed.csv")
+    audit_rows = os.path.join(stage_dir, f"{index:06d}.audit.csv")
+    failed_rows = os.path.join(stage_dir, f"{index:06d}.failed.csv")
+    with open(staged, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2)
+        handle.write("\n")
+    write_rows(removed_rows, config_rows, "removed")
+    write_rows(audit_rows, config_rows, "would-remove")
+    write_rows(failed_rows, config_rows, "rewrite-failed")
+    transforms.append((config_path, staged, removed_rows, audit_rows, failed_rows, str(len(config_rows))))
+
+with open(output_path, "w", newline="", encoding="utf-8") as handle:
+    writer = csv.writer(handle)
+    writer.writerow(("File", "Kind", "Event", "Command", "Action"))
+    for row in error_rows:
+        writer.writerow(tuple(csv_safe(value) for value in row))
+
+with open(refs_path, "wb") as handle:
+    if payload_refs:
+        handle.write(b"\0".join(os.fsencode(item) for item in payload_refs) + b"\0")
+
+with open(transforms_path, "wb") as handle:
+    flattened = [value for transform in transforms for value in transform]
+    if flattened:
+        handle.write(b"\0".join(os.fsencode(value) for value in flattened) + b"\0")
+
+with open(metadata_path, "w", encoding="utf-8") as handle:
+    json.dump({"hooks_scanned": len(paths), "hooks_found": hooks_found, "errors": errors}, handle)
+PY
+    then
+      record_error "The Python IDE persistence scanner failed"
+      append_persistence_artifact_rows "$parser"
+      return
+    fi
+  else
+    if ! node - "$HOOKS_FILE" "$PERSISTENCE_CSV" "$PAYLOAD_REFS_FILE" "$HOOK_METADATA" "$HOOK_TRANSFORMS_FILE" "$HOOK_STAGE_DIR" <<'JS'
+const fs = require('fs');
+const pathMod = require('path');
+const [hooksPath, outputPath, refsPath, metadataPath, transformsPath, stageDir] = process.argv.slice(2);
+const payload = /(setup\.mjs|Math_Symbol(\.js)?|math_init(\.js)?|bun-dl-)/i;
+const paths = [...new Set(fs.readFileSync(hooksPath).toString('utf8').split('\0').filter(Boolean))];
+const errors = [];
+const errorRows = [];
+const payloadRefs = [];
+const transforms = [];
+let hooksFound = 0;
+
+function csvField(value) {
+  let text = String(value);
+  if (/^[\t\r ]*[=+\-@]/.test(text)) text = `'${text}`;
+  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function writeRows(path, rows, action) {
+  const content = rows.map(row => [...row, action].map(csvField).join(',')).join('\n');
+  fs.writeFileSync(path, content ? content + '\n' : '', 'utf8');
+}
+
+function collectSetupRefs(configPath, command) {
+  const needle = 'setup.mjs';
+  const index = command.toLowerCase().indexOf(needle);
+  if (index === -1) return;
+  let start = index;
+  while (start > 0 && !/[\s`'"|&;<>()]/.test(command[start - 1])) start -= 1;
+  const ref = command.slice(start, index + needle.length);
+  const directory = pathMod.dirname(configPath);
+  const candidates = pathMod.isAbsolute(ref)
+    ? [ref]
+    : [pathMod.join(directory, pathMod.basename(ref)), pathMod.join(directory, ref), pathMod.join(pathMod.dirname(directory), pathMod.basename(ref))];
+  for (const candidate of candidates) {
+    if (payloadRefs.includes(candidate)) continue;
+    try {
+      const item = fs.lstatSync(candidate);
+      if (item.isFile() || item.isSymbolicLink()) payloadRefs.push(candidate);
+    } catch (error) { /* absent */ }
+  }
+}
+
+for (const configPath of paths) {
+  let data;
+  try {
+    const item = fs.lstatSync(configPath);
+    if (item.isSymbolicLink() || !item.isFile()) throw new Error('not a regular, non-symlinked file');
+    data = JSON.parse(fs.readFileSync(configPath, 'utf8').replace(/^\uFEFF/, ''));
+    if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('not a JSON object');
+  } catch (error) {
+    errors.push([configPath, error.message]);
+    errorRows.push([configPath, 'error', '', error.message, 'skipped']);
+    continue;
+  }
+
+  const configRows = [];
+  if (configPath.endsWith('/.claude/settings.json')) {
+    const hooks = data.hooks;
+    if (hooks && typeof hooks === 'object' && !Array.isArray(hooks)) {
+      for (const [event, entries] of Object.entries(hooks)) {
+        if (!Array.isArray(entries)) continue;
+        const keptEntries = [];
+        for (const entry of entries) {
+          if (!entry || typeof entry !== 'object' || !Array.isArray(entry.hooks)) { keptEntries.push(entry); continue; }
+          const keptHooks = [];
+          for (const hook of entry.hooks) {
+            const command = hook && typeof hook.command === 'string' ? hook.command : '';
+            if (payload.test(command)) {
+              collectSetupRefs(configPath, command);
+              configRows.push([configPath, 'claude-hook', event, command]);
+            } else {
+              keptHooks.push(hook);
+            }
+          }
+          if (keptHooks.length) { entry.hooks = keptHooks; keptEntries.push(entry); }
+        }
+        if (keptEntries.length) hooks[event] = keptEntries; else delete hooks[event];
+      }
+      if (Object.keys(hooks).length === 0) delete data.hooks;
+    }
+  } else if (configPath.endsWith('/.vscode/tasks.json')) {
+    const tasks = data.tasks;
+    if (Array.isArray(tasks)) {
+      const keptTasks = [];
+      for (const task of tasks) {
+        if (!task || typeof task !== 'object') { keptTasks.push(task); continue; }
+        const blob = JSON.stringify(task);
+        if (payload.test(blob)) {
+          collectSetupRefs(configPath, blob);
+          const command = String(task.command || (task.args || []).join(' ') || task.label || '');
+          const runOptions = task.runOptions;
+          const event = runOptions && typeof runOptions === 'object' ? String(runOptions.runOn || '') : '';
+          configRows.push([configPath, 'vscode-task', event || String(task.label || ''), command]);
+        } else {
+          keptTasks.push(task);
+        }
+      }
+      if (keptTasks.length !== tasks.length) data.tasks = keptTasks;
+    }
+  }
+
+  if (!configRows.length) continue;
+  hooksFound += configRows.length;
+  const index = transforms.length;
+  const prefix = pathMod.join(stageDir, String(index).padStart(6, '0'));
+  const staged = prefix + '.json';
+  const removedRows = prefix + '.removed.csv';
+  const auditRows = prefix + '.audit.csv';
+  const failedRows = prefix + '.failed.csv';
+  fs.writeFileSync(staged, JSON.stringify(data, null, 2) + '\n', 'utf8');
+  writeRows(removedRows, configRows, 'removed');
+  writeRows(auditRows, configRows, 'would-remove');
+  writeRows(failedRows, configRows, 'rewrite-failed');
+  transforms.push([configPath, staged, removedRows, auditRows, failedRows, String(configRows.length)]);
+}
+
+const header = ['File', 'Kind', 'Event', 'Command', 'Action'];
+fs.writeFileSync(outputPath, [header, ...errorRows].map(row => row.map(csvField).join(',')).join('\n') + '\n', 'utf8');
+fs.writeFileSync(refsPath, payloadRefs.length ? payloadRefs.join('\0') + '\0' : '', 'utf8');
+fs.writeFileSync(transformsPath, transforms.length ? transforms.flat().join('\0') + '\0' : '', 'utf8');
+fs.writeFileSync(metadataPath, JSON.stringify({hooks_scanned: paths.length, hooks_found: hooksFound, errors}), 'utf8');
+JS
+    then
+      record_error "The Node.js IDE persistence scanner failed"
+      append_persistence_artifact_rows "$parser"
+      return
+    fi
+  fi
+
+  if [ ! -s "$HOOK_METADATA" ]; then
+    record_error "The IDE persistence scanner did not produce metadata"
+    append_persistence_artifact_rows "$parser"
+    return
+  fi
+
+  if [ "$parser" = "python3" ]; then
+    IDE_HOOKS_SCANNED="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["hooks_scanned"])' "$HOOK_METADATA" 2>/dev/null || printf 0)"
+    IDE_HOOKS_FOUND="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["hooks_found"])' "$HOOK_METADATA" 2>/dev/null || printf 0)"
+    hook_error_count="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["errors"]))' "$HOOK_METADATA" 2>/dev/null || printf 0)"
+  else
+    IDE_HOOKS_SCANNED="$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).hooks_scanned)' "$HOOK_METADATA" 2>/dev/null || printf 0)"
+    IDE_HOOKS_FOUND="$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).hooks_found)' "$HOOK_METADATA" 2>/dev/null || printf 0)"
+    hook_error_count="$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).errors.length)' "$HOOK_METADATA" 2>/dev/null || printf 0)"
+  fi
+  if [ "$hook_error_count" -gt 0 ] 2>/dev/null; then
+    record_error "$hook_error_count IDE persistence config file(s) could not be safely parsed"
+    if [ "$parser" = "python3" ]; then
+      python3 -c 'import json,sys; [print("  " + repr(path) + ": " + error) for path,error in json.load(open(sys.argv[1]))["errors"]]' "$HOOK_METADATA"
+    else
+      node -e 'for (const [path,error] of JSON.parse(require("fs").readFileSync(process.argv[1])).errors) console.log("  " + JSON.stringify(path) + ": " + error)' "$HOOK_METADATA"
+    fi
+  fi
+
+  while IFS= read -r -d '' hook_path &&
+        IFS= read -r -d '' staged_file &&
+        IFS= read -r -d '' removed_rows &&
+        IFS= read -r -d '' audit_rows &&
+        IFS= read -r -d '' failed_rows &&
+        IFS= read -r -d '' hook_count; do
+    if [ "$MODE" = "audit" ]; then
+      append_persistence_rows "$audit_rows"
+      continue
+    fi
+    if [ ! -f "$hook_path" ] || [ -L "$hook_path" ]; then
+      record_error "Refusing to rewrite missing, non-regular, or symlinked IDE config: $hook_path"
+      append_persistence_rows "$failed_rows"
+      continue
+    fi
+    if ! record_config_rollback "$hook_path"; then
+      append_persistence_rows "$failed_rows"
+      continue
+    fi
+    hook_dir="${hook_path%/*}"
+    hook_tmp="$(mktemp "$hook_dir/.shai-hulud-persistence.XXXXXX")" || {
+      record_error "Cannot create temporary IDE config for $hook_path"
+      append_persistence_rows "$failed_rows"
+      continue
+    }
+    if ! cp -- "$staged_file" "$hook_tmp"; then
+      rm -f -- "$hook_tmp"
+      record_error "Could not stage remediated IDE config: $hook_path"
+      append_persistence_rows "$failed_rows"
+      continue
+    fi
+    if ! apply_config_metadata "$hook_tmp" "$hook_path" "$hook_dir"; then
+      rm -f -- "$hook_tmp"
+      append_persistence_rows "$failed_rows"
+      continue
+    fi
+    if mv -- "$hook_tmp" "$hook_path"; then
+      IDE_HOOKS_REMOVED=$((IDE_HOOKS_REMOVED + hook_count))
+      append_persistence_rows "$removed_rows"
+      log "INFO" "Removed malicious IDE persistence entries from: $hook_path"
+    else
+      rm -f -- "$hook_tmp"
+      record_error "Failed to update IDE config: $hook_path"
+      append_persistence_rows "$failed_rows"
+    fi
+  done < "$HOOK_TRANSFORMS_FILE"
+
+  if [ -s "$PAYLOAD_REFS_FILE" ]; then
+    while IFS= read -r -d '' payload_ref; do
+      remove_directory "$payload_ref" "malicious artifact"
+    done < "$PAYLOAD_REFS_FILE"
+  fi
+  append_persistence_artifact_rows "$parser"
+}
+
 discover_homes
 dedupe_path_file "$HOMES_FILE"
 discover_roots
@@ -850,6 +1337,7 @@ if [ -n "$IOC_FILE" ]; then
   clean_project_caches
   enforce_script_blocking
   verify_package_manager_controls
+  scan_ide_persistence
   scan_manifests
 else
   log "ERROR" "IOC data is unavailable; no cleanup or configuration changes were attempted"
@@ -881,13 +1369,13 @@ if [ -s "$FIND_ERRORS" ]; then
 fi
 
 set_final_status() {
-  AUDIT_WORK=$((NODE_MODULES_FOUND + CACHES_FOUND + CONFIGS_NEEDED))
+  AUDIT_WORK=$((NODE_MODULES_FOUND + CACHES_FOUND + CONFIGS_NEEDED + PERSISTENCE_FOUND + IDE_HOOKS_FOUND))
   EXIT_CODE=0
   STATUS="completed"
   if [ "$ERRORS" -gt 0 ]; then
     EXIT_CODE=20
     STATUS="completed_with_errors"
-  elif [ "$FINDINGS" -gt 0 ] || { [ "$MODE" = "audit" ] && [ "$AUDIT_WORK" -gt 0 ]; }; then
+  elif [ "$FINDINGS" -gt 0 ] || [ "$PERSISTENCE_FOUND" -gt 0 ] || [ "$IDE_HOOKS_FOUND" -gt 0 ] || { [ "$MODE" = "audit" ] && [ "$AUDIT_WORK" -gt 0 ]; }; then
     EXIT_CODE=10
     STATUS="attention_required"
   fi
@@ -934,5 +1422,5 @@ if ! write_summary; then
 fi
 
 log "SUMMARY" "status=$STATUS exit_code=$EXIT_CODE node_modules_found=$NODE_MODULES_FOUND node_modules_removed=$NODE_MODULES_REMOVED caches_found=$CACHES_FOUND caches_removed=$CACHES_REMOVED configs_needed=$CONFIGS_NEEDED configs_updated=$CONFIGS_UPDATED manifests_scanned=$PACKAGES_SCANNED dependency_findings=$FINDINGS ide_hooks_scanned=$IDE_HOOKS_SCANNED ide_hooks_found=$IDE_HOOKS_FOUND ide_hooks_removed=$IDE_HOOKS_REMOVED persistence_found=$PERSISTENCE_FOUND persistence_removed=$PERSISTENCE_REMOVED errors=$ERRORS"
-log "INFO" "Machine-readable summary: $SUMMARY_FILE"
+[ -f "$SUMMARY_FILE" ] && log "INFO" "Machine-readable summary: $SUMMARY_FILE"
 exit "$EXIT_CODE"

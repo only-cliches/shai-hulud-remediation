@@ -38,6 +38,8 @@ Windows, as SYSTEM or Administrator using 64-bit Windows PowerShell 5.1 or Power
 powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\scripts\Remediate-ShaiHulud.ps1
 ```
 
+The macOS/Linux script requires a working `python3` or Node.js executable for JSON manifest and IDE hook/task parsing. On macOS, install or select the Command Line Tools (or provide another trusted interpreter on `PATH`) before deployment; the `/usr/bin` developer-tool shim is not sufficient. If no usable parser is available, the script still removes direct incident-named payload artifacts, records an operational error, and leaves dependency and hook/task results incomplete until a parser is installed.
+
 Omitting the IOC option downloads the current [Wiz IOC list](https://raw.githubusercontent.com/wiz-sec-public/wiz-research-iocs/refs/heads/main/reports/keyv-packages.csv) over HTTPS. Egress-restricted or tightly controlled environments should always use a pre-staged file.
 
 Recommended rollout:

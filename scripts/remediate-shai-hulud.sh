@@ -6,7 +6,7 @@ set -u
 set -o pipefail
 umask 077
 
-VERSION="2.2.0"
+VERSION="2.2.1"
 IOC_URL="https://raw.githubusercontent.com/wiz-sec-public/wiz-research-iocs/refs/heads/main/reports/keyv-packages.csv"
 MODE="remediate"
 IOC_FILE=""
@@ -18,6 +18,7 @@ CONFIG_BACKUP_SEQUENCE=0
 SYSTEM_NPM_CONFIG=""
 CUSTOM_SCOPE=0
 ERRORS=0
+FIND_ATTEMPT_SEQUENCE=0
 NODE_MODULES_FOUND=0
 NODE_MODULES_REMOVED=0
 CACHES_FOUND=0
@@ -213,6 +214,50 @@ record_error() {
   log "ERROR" "$1"
 }
 
+python3_usable() {
+  command -v python3 >/dev/null 2>&1 && python3 -c 'import json' >/dev/null 2>&1
+}
+
+node_usable() {
+  command -v node >/dev/null 2>&1 && node -e 'process.exit(0)' >/dev/null 2>&1
+}
+
+run_find_nul() {
+  local output attempt_errors attempt
+  output="$1"
+  shift
+  attempt=1
+  while [ "$attempt" -le 2 ]; do
+    FIND_ATTEMPT_SEQUENCE=$((FIND_ATTEMPT_SEQUENCE + 1))
+    attempt_errors="$WORK_DIR/find-attempt-$FIND_ATTEMPT_SEQUENCE.err"
+    : > "$output"
+    : > "$attempt_errors"
+    if find "$@" -print0 > "$output" 2> "$attempt_errors"; then
+      if [ ! -s "$attempt_errors" ]; then
+        return 0
+      fi
+      # A few macOS find builds can return success while still reporting a
+      # transient EINTR. Retry it just as we do for a non-zero find status.
+      if [ "$attempt" -eq 1 ] && ! grep -qvF 'fts_read: Interrupted system call' "$attempt_errors"; then
+        attempt=2
+        continue
+      fi
+      cat "$attempt_errors" >> "$FIND_ERRORS"
+      return 0
+    fi
+    # macOS find can report a transient EINTR while a nearby cache or
+    # application tree changes. Retry that specific condition once; retain
+    # all other traversal errors for the final operational-error report.
+    if [ "$attempt" -eq 1 ] && ! grep -qvF 'fts_read: Interrupted system call' "$attempt_errors"; then
+      attempt=2
+      continue
+    fi
+    cat "$attempt_errors" >> "$FIND_ERRORS"
+    return 1
+  done
+  return 1
+}
+
 discover_roots() {
   local candidate
   if [ "$CUSTOM_SCOPE" -eq 1 ]; then
@@ -241,11 +286,11 @@ discover_roots() {
 
 discover_homes() {
   [ "$CUSTOM_SCOPE" -eq 0 ] || return
-  [ -n "${HOME:-}" ] && [ -d "$HOME" ] && [ ! -L "$HOME" ] && printf '%s\n' "$HOME" >> "$HOMES_FILE"
+  [ -n "${HOME:-}" ] && [ "$HOME" != "/" ] && [ -d "$HOME" ] && [ ! -L "$HOME" ] && printf '%s\n' "$HOME" >> "$HOMES_FILE"
   if [ "$OS_NAME" = "Darwin" ]; then
     [ -d /var/root ] && [ ! -L /var/root ] && printf '/var/root\n' >> "$HOMES_FILE"
     for candidate in /Users/*; do
-      [ -d "$candidate" ] && [ ! -L "$candidate" ] && printf '%s\n' "$candidate" >> "$HOMES_FILE"
+      [ "$candidate" != "/" ] && [ -d "$candidate" ] && [ ! -L "$candidate" ] && printf '%s\n' "$candidate" >> "$HOMES_FILE"
     done
   else
     [ -d /root ] && [ ! -L /root ] && printf '/root\n' >> "$HOMES_FILE"
@@ -254,7 +299,7 @@ discover_homes() {
     done
     if [ -r /etc/passwd ]; then
       awk -F: '$3 == 0 || $3 >= 1000 { if ($6 ~ /^\//) print $6 }' /etc/passwd | while IFS= read -r candidate; do
-        [ -d "$candidate" ] && [ ! -L "$candidate" ] && printf '%s\n' "$candidate" >> "$HOMES_FILE"
+        [ "$candidate" != "/" ] && [ -d "$candidate" ] && [ ! -L "$candidate" ] && printf '%s\n' "$candidate" >> "$HOMES_FILE"
       done
     fi
   fi
@@ -344,19 +389,23 @@ remove_directory() {
 }
 
 scan_node_modules_and_projects() {
-  local root target package_file
+  local root target package_file find_output
   while IFS= read -r root; do
     [ -d "$root" ] || { record_error "Scan root is no longer available: $root"; continue; }
     log "INFO" "Scanning filesystem: $root"
 
+    find_output="$WORK_DIR/find-$FIND_ATTEMPT_SEQUENCE.bin"
+    run_find_nul "$find_output" "$root" -xdev \( -type d -o -type l \) -name node_modules -prune || true
     while IFS= read -r -d '' target; do
       [ "${target##*/}" = "node_modules" ] || { record_error "Safety check rejected unexpected deletion target: $target"; continue; }
       remove_directory "$target" "node_modules"
-    done < <(find "$root" -xdev \( -type d -o -type l \) -name node_modules -prune -print0 2>> "$FIND_ERRORS")
+    done < "$find_output"
 
+    find_output="$WORK_DIR/find-$FIND_ATTEMPT_SEQUENCE.bin"
+    run_find_nul "$find_output" "$root" -xdev -type d -name node_modules -prune -o -type f -name package.json || true
     while IFS= read -r -d '' package_file; do
       printf '%s\0' "$package_file" >> "$PACKAGES_FILE"
-    done < <(find "$root" -xdev -type d -name node_modules -prune -o -type f -name package.json -print0 2>> "$FIND_ERRORS")
+    done < "$find_output"
   done < "$ROOTS_FILE"
 }
 
@@ -391,11 +440,13 @@ clean_known_caches() {
 }
 
 clean_project_caches() {
-  local root project_cache
+  local root project_cache find_output
   while IFS= read -r root; do
+    find_output="$WORK_DIR/find-$FIND_ATTEMPT_SEQUENCE.bin"
+    run_find_nul "$find_output" "$root" -xdev \( -type d -o -type l \) \( -path '*/.yarn/cache' -o -name .pnpm-store \) -prune || true
     while IFS= read -r -d '' project_cache; do
       remove_directory "$project_cache" "project package cache"
-    done < <(find "$root" -xdev \( -type d -o -type l \) \( -path '*/.yarn/cache' -o -name .pnpm-store \) -prune -print0 2>> "$FIND_ERRORS")
+    done < "$find_output"
   done < "$ROOTS_FILE"
 }
 
@@ -618,10 +669,29 @@ write_bun_config() {
   fi
 }
 
+package_directory() {
+  local package_file directory
+  package_file="$1"
+  directory="${package_file%/*}"
+  [ "$directory" = "//" ] && directory="/"
+  printf '%s\n' "$directory"
+}
+
+prune_missing_package_paths() {
+  local package_file existing_packages
+  existing_packages="$WORK_DIR/package-files-existing.bin"
+  : > "$existing_packages"
+  while IFS= read -r -d '' package_file; do
+    [ -f "$package_file" ] && printf '%s\0' "$package_file" >> "$existing_packages"
+  done < "$PACKAGES_FILE"
+  mv -- "$existing_packages" "$PACKAGES_FILE"
+}
+
 secure_config_directory() {
   local directory scope
   directory="$1"
   scope="${2:-profile}"
+  [ "$directory" != "/" ] || { record_error "Refusing to modify lifecycle policy at filesystem root"; return; }
   write_equals_config "$directory/.npmrc" "ignore-scripts" "true" "npm/pnpm lifecycle-script blocking"
   write_space_config "$directory/.yarnrc" "--install.ignore-scripts" "true" "Yarn Classic lifecycle-script blocking"
   write_colon_config "$directory/.yarnrc.yml" "enableScripts" "false" "Yarn lifecycle-script blocking"
@@ -656,7 +726,7 @@ enforce_script_blocking() {
   fi
 
   while IFS= read -r -d '' package_file; do
-    project_dir="${package_file%/*}"
+    project_dir="$(package_directory "$package_file")"
     secure_config_directory "$project_dir" "project"
   done < "$PACKAGES_FILE"
 }
@@ -665,6 +735,7 @@ verify_config_directory() {
   local directory scope
   directory="$1"
   scope="${2:-profile}"
+  [ "$directory" != "/" ] || { record_error "Refusing to verify lifecycle policy at filesystem root"; return; }
   config_is_compliant "$directory/.npmrc" "^[[:space:]]*ignore-scripts[[:space:]]*=" "^[[:space:]]*ignore-scripts[[:space:]]*=[[:space:]]*true[[:space:]]*(#.*)?$" "true" || record_error "npm/pnpm policy verification failed: $directory/.npmrc"
   config_is_compliant "$directory/.yarnrc" "^[[:space:]]*--install.ignore-scripts[[:space:]]+" "^[[:space:]]*--install.ignore-scripts[[:space:]]+true[[:space:]]*(#.*)?$" "false" || record_error "Yarn Classic policy verification failed: $directory/.yarnrc"
   config_is_compliant "$directory/.yarnrc.yml" "^enableScripts[[:space:]]*:" "^enableScripts[[:space:]]*:[[:space:]]*false[[:space:]]*(#.*)?$" "false" || record_error "Yarn policy verification failed: $directory/.yarnrc.yml"
@@ -691,7 +762,7 @@ verify_package_manager_controls() {
     done < "$HOMES_FILE"
   fi
   while IFS= read -r -d '' package_file; do
-    project_dir="${package_file%/*}"
+    project_dir="$(package_directory "$package_file")"
     verify_config_directory "$project_dir" "project"
   done < "$PACKAGES_FILE"
 }
@@ -722,17 +793,20 @@ obtain_iocs() {
 scan_manifests() {
   local scanner scan_metadata
   [ -n "$IOC_FILE" ] || return
+  # Cache cleanup happens before manifest parsing. Remove paths that no
+  # longer exist so transient cache entries do not become false parse errors.
+  prune_missing_package_paths
   scanner=""
-  if [ "${SHAI_HULUD_MANIFEST_PARSER:-auto}" = "node" ] && command -v node >/dev/null 2>&1; then
+  if [ "${SHAI_HULUD_MANIFEST_PARSER:-auto}" = "node" ] && node_usable; then
     scanner="node"
-  elif [ "${SHAI_HULUD_MANIFEST_PARSER:-auto}" = "python3" ] && command -v python3 >/dev/null 2>&1; then
+  elif [ "${SHAI_HULUD_MANIFEST_PARSER:-auto}" = "python3" ] && python3_usable; then
     scanner="python3"
   elif [ "${SHAI_HULUD_MANIFEST_PARSER:-auto}" = "auto" ]; then
-    command -v python3 >/dev/null 2>&1 && scanner="python3"
-    if [ -z "$scanner" ] && command -v node >/dev/null 2>&1; then scanner="node"; fi
+    python3_usable && scanner="python3"
+    if [ -z "$scanner" ] && node_usable; then scanner="node"; fi
   fi
   if [ -z "$scanner" ]; then
-    record_error "python3 or node is required for safe package.json parsing on macOS/Linux"
+    record_error "a working python3 or node executable is required for safe package.json parsing on macOS/Linux"
     return
   fi
 
@@ -898,7 +972,7 @@ append_persistence_rows() {
 }
 
 append_persistence_artifact_rows() {
-  local parser
+  local parser artifact_file artifact_action artifact_file_csv artifact_action_csv
   parser="$1"
   [ -s "$PERSISTENCE_ARTIFACTS_FILE" ] || return
   if [ "$parser" = "python3" ]; then
@@ -923,7 +997,7 @@ PY
     then
       record_error "Could not append malicious artifact rows to the persistence report"
     fi
-  else
+  elif [ "$parser" = "node" ]; then
     if ! node - "$PERSISTENCE_ARTIFACTS_FILE" "$PERSISTENCE_CSV" <<'JS'
 const fs = require('fs');
 const [eventsPath, outputPath] = process.argv.slice(2);
@@ -944,11 +1018,19 @@ JS
     then
       record_error "Could not append malicious artifact rows to the persistence report"
     fi
+  else
+    # Direct payload artifacts can still be reported when neither JSON parser
+    # is usable. Keep the rows CSV-safe without invoking the unavailable tool.
+    while IFS= read -r -d '' artifact_file && IFS= read -r -d '' artifact_action; do
+      artifact_file_csv="$(printf '%s' "$artifact_file" | sed 's/"/""/g')"
+      artifact_action_csv="$(printf '%s' "$artifact_action" | sed 's/"/""/g')"
+      printf '"%s",payload,,,"%s"\n' "$artifact_file_csv" "$artifact_action_csv" >> "$PERSISTENCE_CSV"
+    done < "$PERSISTENCE_ARTIFACTS_FILE"
   fi
 }
 
 scan_ide_persistence() {
-  local root hook_file payload_file payload_dir payload_ref parser
+  local root hook_file payload_file payload_dir payload_ref parser find_output
   local hook_path staged_file removed_rows audit_rows failed_rows hook_count
   local hook_dir hook_tmp hook_error_count
 
@@ -956,37 +1038,44 @@ scan_ide_persistence() {
   mkdir -p -m 700 -- "$HOOK_STAGE_DIR" || { record_error "Could not create the private IDE scanner staging directory"; return; }
 
   parser=""
-  if [ "${SHAI_HULUD_MANIFEST_PARSER:-auto}" = "node" ] && command -v node >/dev/null 2>&1; then
+  if [ "${SHAI_HULUD_MANIFEST_PARSER:-auto}" = "node" ] && node_usable; then
     parser="node"
-  elif [ "${SHAI_HULUD_MANIFEST_PARSER:-auto}" = "python3" ] && command -v python3 >/dev/null 2>&1; then
+  elif [ "${SHAI_HULUD_MANIFEST_PARSER:-auto}" = "python3" ] && python3_usable; then
     parser="python3"
   elif [ "${SHAI_HULUD_MANIFEST_PARSER:-auto}" = "auto" ]; then
-    command -v python3 >/dev/null 2>&1 && parser="python3"
-    if [ -z "$parser" ] && command -v node >/dev/null 2>&1; then parser="node"; fi
+    python3_usable && parser="python3"
+    if [ -z "$parser" ] && node_usable; then parser="node"; fi
   fi
-  if [ -z "$parser" ]; then
-    record_error "python3 or node is required for IDE persistence scanning on macOS/Linux"
-    return
-  fi
-
   # Collect IDE configuration files and remove only the incident's known
   # payload basenames. setup.mjs is removed only when referenced by a matched
   # malicious hook or task.
   while IFS= read -r root; do
     [ -d "$root" ] || { record_error "Persistence scan root is no longer available: $root"; continue; }
 
+    find_output="$WORK_DIR/find-$FIND_ATTEMPT_SEQUENCE.bin"
+    run_find_nul "$find_output" "$root" -xdev -type d -name node_modules -prune -o -type f \( -path '*/.claude/settings.json' -o -path '*/.vscode/tasks.json' \) || true
     while IFS= read -r -d '' hook_file; do
       printf '%s\0' "$hook_file" >> "$HOOKS_FILE"
-    done < <(find "$root" -xdev -type d -name node_modules -prune -o -type f \( -path '*/.claude/settings.json' -o -path '*/.vscode/tasks.json' \) -print0 2>> "$FIND_ERRORS")
+    done < "$find_output"
 
+    find_output="$WORK_DIR/find-$FIND_ATTEMPT_SEQUENCE.bin"
+    run_find_nul "$find_output" "$root" -xdev -type d -name node_modules -prune -o -type f \( -name 'Math_Symbol.js' -o -name 'math_init.js' \) || true
     while IFS= read -r -d '' payload_file; do
       remove_directory "$payload_file" "malicious artifact"
-    done < <(find "$root" -xdev -type d -name node_modules -prune -o -type f \( -name 'Math_Symbol.js' -o -name 'math_init.js' \) -print0 2>> "$FIND_ERRORS")
+    done < "$find_output"
 
+    find_output="$WORK_DIR/find-$FIND_ATTEMPT_SEQUENCE.bin"
+    run_find_nul "$find_output" "$root" -xdev -type d -name 'bun-dl-*' -prune || true
     while IFS= read -r -d '' payload_dir; do
       remove_directory "$payload_dir" "malicious artifact"
-    done < <(find "$root" -xdev -type d -name 'bun-dl-*' -prune -print0 2>> "$FIND_ERRORS")
+    done < "$find_output"
   done < "$ROOTS_FILE"
+
+  if [ -z "$parser" ]; then
+    record_error "a working python3 or node executable is required for IDE hook/task scanning on macOS/Linux"
+    append_persistence_artifact_rows "$parser"
+    return
+  fi
 
   if [ ! -s "$HOOKS_FILE" ]; then
     append_persistence_artifact_rows "$parser"
@@ -1375,6 +1464,7 @@ if [ -n "$IOC_FILE" ]; then
   scan_node_modules_and_projects
   clean_known_caches
   clean_project_caches
+  prune_missing_package_paths
   enforce_script_blocking
   verify_package_manager_controls
   scan_ide_persistence

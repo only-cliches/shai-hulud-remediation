@@ -18,7 +18,7 @@ param(
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Continue'
-$ToolVersion = '2.2.0'
+$ToolVersion = '2.2.1'
 $IocUrl = 'https://raw.githubusercontent.com/wiz-sec-public/wiz-research-iocs/refs/heads/main/reports/keyv-packages.csv'
 $Mode = if ($AuditOnly) { 'audit' } else { 'remediate' }
 $CustomScope = $null -ne $ScanRoot -and $ScanRoot.Count -gt 0

@@ -16,6 +16,7 @@ trap 'exit 143' TERM
 cp -R "$TEST_DIR/fixtures/project" "$RUN_DIR/project"
 chmod 640 "$RUN_DIR/project/.claude/settings.json" "$RUN_DIR/project/.vscode/tasks.json"
 mkdir -p "$RUN_DIR/project/node_modules/bad-package" "$RUN_DIR/project/.yarn/cache/archive" "$RUN_DIR/reports"
+printf '%s\n' '{"name":"stale-cache-entry"}' > "$RUN_DIR/project/.yarn/cache/archive/package.json"
 mkdir -p "$RUN_DIR/linked-node-modules-target" "$RUN_DIR/project/linked"
 touch "$RUN_DIR/linked-node-modules-target/keep"
 ln -s "$RUN_DIR/linked-node-modules-target" "$RUN_DIR/project/linked/node_modules"
@@ -206,6 +207,27 @@ SYMLINK_ROOT_EXIT=$?
 set -e
 [ "$SYMLINK_ROOT_EXIT" -eq 30 ]
 [ -d "$RUN_DIR/invalid-ioc-project/node_modules/keep" ]
+
+# Regression: an unusable macOS developer-tool shim must not prevent direct
+# incident-named payloads from being removed, even though JSON-dependent scans
+# correctly return an operational error.
+NO_PARSER_BIN="$RUN_DIR/no-parser-bin"
+mkdir -p "$NO_PARSER_BIN" "$RUN_DIR/no-parser-project" "$RUN_DIR/no-parser-reports"
+printf '%s\n' '#!/bin/sh' 'exit 1' > "$NO_PARSER_BIN/python3"
+printf '%s\n' '#!/bin/sh' 'exit 1' > "$NO_PARSER_BIN/node"
+chmod 755 "$NO_PARSER_BIN/python3" "$NO_PARSER_BIN/node"
+touch "$RUN_DIR/no-parser-project/Math_Symbol.js"
+set +e
+PATH="$NO_PARSER_BIN:/usr/bin:/bin" "$SCRIPT_PATH" \
+  --scan-root "$RUN_DIR/no-parser-project" \
+  --report-dir "$RUN_DIR/no-parser-reports" \
+  --backup-dir "$RUN_DIR/no-parser-backups" \
+  --ioc-file "$TEST_DIR/fixtures/iocs.csv" >/dev/null
+NO_PARSER_EXIT=$?
+set -e
+[ "$NO_PARSER_EXIT" -eq 20 ]
+[ ! -e "$RUN_DIR/no-parser-project/Math_Symbol.js" ]
+grep -q 'payload.*removed' "$RUN_DIR/no-parser-reports"/*Persistence*.csv
 
 # Regression: valid JSON that is not an object must be reported as a parse
 # error without aborting either parser before valid manifests are scanned.

@@ -29,13 +29,13 @@ Pre-stage the appropriate script and, preferably, a reviewed IOC CSV in the mana
 macOS/Linux, as root:
 
 ```bash
-/bin/bash ./scripts/remediate-shai-hulud.sh --ioc-file ./keyv-packages.csv
+/bin/bash ./scripts/remediate-shai-hulud.sh
 ```
 
 Windows, as SYSTEM or Administrator using 64-bit Windows PowerShell 5.1 or PowerShell 7:
 
 ```powershell
-powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\scripts\Remediate-ShaiHulud.ps1 -IocFile .\keyv-packages.csv
+powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\scripts\Remediate-ShaiHulud.ps1
 ```
 
 Omitting the IOC option downloads the current [Wiz IOC list](https://raw.githubusercontent.com/wiz-sec-public/wiz-research-iocs/refs/heads/main/reports/keyv-packages.csv) over HTTPS. Egress-restricted or tightly controlled environments should always use a pre-staged file.

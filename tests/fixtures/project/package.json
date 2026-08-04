@@ -1,0 +1,11 @@
+{
+  "name": "remediation-fixture",
+  "private": true,
+  "dependencies": {
+    "bad-package": "1.2.3",
+    "safe-package": "2.0.0"
+  },
+  "devDependencies": {
+    "@bad/scoped": "^4.5.0"
+  }
+}

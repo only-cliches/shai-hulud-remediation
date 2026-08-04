@@ -6,7 +6,7 @@ set -u
 set -o pipefail
 umask 077
 
-VERSION="2.2.1"
+VERSION="3.0.0"
 IOC_URL="https://raw.githubusercontent.com/wiz-sec-public/wiz-research-iocs/refs/heads/main/reports/keyv-packages.csv"
 MODE="remediate"
 IOC_FILE=""
@@ -17,6 +17,7 @@ CONFIG_BACKUP_MANIFEST=""
 CONFIG_BACKUP_SEQUENCE=0
 SYSTEM_NPM_CONFIG=""
 CUSTOM_SCOPE=0
+INCLUDE_APPLICATION_DIRS=0
 ERRORS=0
 FIND_ATTEMPT_SEQUENCE=0
 NODE_MODULES_FOUND=0
@@ -43,7 +44,7 @@ usage() {
   cat <<'EOF'
 Usage: remediate-shai-hulud.sh [options]
 
-Runs remediation without prompting. Remediation is the default mode.
+Runs evidence-driven remediation without prompting. Remediation is the default mode.
 
 Options:
   --audit-only          Scan and report without changing the endpoint
@@ -51,6 +52,8 @@ Options:
   --report-dir PATH     Write reports to PATH
   --backup-dir PATH     Store restricted configuration backups in PATH
   --scan-root PATH      Scan only PATH (repeatable); bounds cleanup/config work
+  --include-application-dirs
+                        Include known application/state directories in scans
   --help                Show this help
 
 Exit codes:
@@ -66,6 +69,8 @@ ROOTS_FILE="$WORK_DIR/roots.txt"
 HOMES_FILE="$WORK_DIR/homes.txt"
 PACKAGES_FILE="$WORK_DIR/package-files.bin"
 FINDINGS_FILE="$WORK_DIR/findings.csv"
+NODE_MODULE_TARGETS_FILE="$WORK_DIR/node-modules-targets.bin"
+REMOVALS_FILE="$WORK_DIR/node-modules-actions.csv"
 FIND_ERRORS="$WORK_DIR/find-errors.log"
 HOOKS_FILE="$WORK_DIR/hooks.bin"
 PERSISTENCE_CSV="$WORK_DIR/persistence.csv"
@@ -77,6 +82,8 @@ PERSISTENCE_ARTIFACTS_FILE="$WORK_DIR/persistence-artifacts.bin"
 : > "$ROOTS_FILE"
 : > "$HOMES_FILE"
 : > "$PACKAGES_FILE"
+: > "$NODE_MODULE_TARGETS_FILE"
+printf 'Node Modules,Action\n' > "$REMOVALS_FILE"
 : > "$FIND_ERRORS"
 : > "$HOOKS_FILE"
 : > "$PAYLOAD_REFS_FILE"
@@ -128,6 +135,9 @@ while [ "$#" -gt 0 ]; do
       CUSTOM_SCOPE=1
       shift
       ;;
+    --include-application-dirs)
+      INCLUDE_APPLICATION_DIRS=1
+      ;;
     --help|-h)
       usage
       exit 0
@@ -146,6 +156,53 @@ case "$OS_NAME" in
   Linux|Darwin) ;;
   *) printf 'ERROR: unsupported operating system: %s\n' "$OS_NAME" >&2; exit 30 ;;
 esac
+
+# These directories commonly contain application bundles, managed IDE
+# extensions, package-manager caches, or other tool-owned state. They are not
+# source workspaces and changing dependency trees inside them can damage an
+# installed application. The IDE persistence scanner uses a second list that
+# permits only the narrow .claude/settings.json and .vscode/tasks.json checks.
+APPLICATION_DIR_FIND_TEST=(
+  -name .cache -o -name .config -o -name .local -o -name .npm
+  -o -name .pnpm-store -o -name .yarn -o -name .bun -o -name .corepack
+  -o -name .nvm -o -name .fnm -o -name .volta -o -name .asdf -o -name .nodenv -o -name .node-gyp
+  -o -name .vscode -o -name .vscode-insiders -o -name .vscode-oss
+  -o -name .vscode-server -o -name .vscode-server-insiders
+  -o -name .cursor -o -name .cursor-server -o -name .windsurf -o -name .windsurf-server
+  -o -name .claude -o -name .codex -o -name .opencode
+  -o -name Applications
+)
+APPLICATION_DIR_EXCEPT_IDE_FIND_TEST=(
+  -name .cache -o -name .config -o -name .local -o -name .npm
+  -o -name .pnpm-store -o -name .yarn -o -name .bun -o -name .corepack
+  -o -name .nvm -o -name .fnm -o -name .volta -o -name .asdf -o -name .nodenv -o -name .node-gyp
+  -o -name .vscode-insiders -o -name .vscode-oss
+  -o -name .vscode-server -o -name .vscode-server-insiders
+  -o -name .cursor -o -name .cursor-server -o -name .windsurf -o -name .windsurf-server
+  -o -name .codex -o -name .opencode
+  -o -name Applications
+)
+if [ "$OS_NAME" = "Darwin" ]; then
+  APPLICATION_DIR_FIND_TEST+=(
+    -o -name Library -o -name '*.app'
+    -o -path /System -o -path /Library -o -path /Applications
+  )
+  APPLICATION_DIR_EXCEPT_IDE_FIND_TEST+=(
+    -o -name Library -o -name '*.app'
+    -o -path /System -o -path /Library -o -path /Applications
+  )
+else
+  APPLICATION_DIR_FIND_TEST+=(
+    -o -name .var -o -name snap
+    -o -path /usr -o -path /opt -o -path /snap
+    -o -path /var/lib -o -path /var/cache -o -path /var/snap
+  )
+  APPLICATION_DIR_EXCEPT_IDE_FIND_TEST+=(
+    -o -name .var -o -name snap
+    -o -path /usr -o -path /opt -o -path /snap
+    -o -path /var/lib -o -path /var/cache -o -path /var/snap
+  )
+fi
 
 if [ "$CUSTOM_SCOPE" -eq 0 ] && [ "$(id -u)" -ne 0 ]; then
   printf 'ERROR: default-scope remediation requires root. Use sudo or an elevated RMM agent.\n' >&2
@@ -178,6 +235,7 @@ RUN_ID="$(date -u '+%Y%m%dT%H%M%SZ')-$$"
 REPORT_FILE="$REPORT_DIR/Shai-Hulud-Remediation-$RUN_ID.log"
 SUMMARY_FILE="$REPORT_DIR/Shai-Hulud-Remediation-$RUN_ID.json"
 FINAL_FINDINGS_FILE="$REPORT_DIR/Shai-Hulud-Dependencies-$RUN_ID.csv"
+FINAL_REMOVALS_FILE="$REPORT_DIR/Shai-Hulud-NodeModules-$RUN_ID.csv"
 FINAL_PERSISTENCE_FILE="$REPORT_DIR/Shai-Hulud-Persistence-$RUN_ID.csv"
 if [ -n "$BACKUP_DIR" ]; then
   CONFIG_BACKUP_DIR="$BACKUP_DIR/$RUN_ID"
@@ -346,6 +404,16 @@ discover_npm_prefixes() {
   done | awk 'NF && !seen[$0]++'
 }
 
+append_node_modules_action() {
+  local target action target_csv
+  target="$1"
+  action="$2"
+  target_csv="$(printf '%s' "$target" | sed 's/"/""/g')"
+  if ! printf '"%s","%s"\n' "$target_csv" "$action" >> "$REMOVALS_FILE"; then
+    record_error "Could not append node_modules action to the report: $target"
+  fi
+}
+
 remove_directory() {
   local target kind
   target="$1"
@@ -362,7 +430,9 @@ remove_directory() {
 
   if [ "$MODE" = "audit" ]; then
     log "AUDIT" "Would remove $kind: $target"
-    if [ "$kind" = "malicious artifact" ]; then
+    if [ "$kind" = "node_modules" ]; then
+      append_node_modules_action "$target" "would-remove"
+    elif [ "$kind" = "malicious artifact" ]; then
       printf '%s\0%s\0' "$target" "would-remove" >> "$PERSISTENCE_ARTIFACTS_FILE"
     fi
     return
@@ -378,35 +448,46 @@ remove_directory() {
     fi
     if [ "$kind" = "malicious artifact" ]; then
       printf '%s\0%s\0' "$target" "removed" >> "$PERSISTENCE_ARTIFACTS_FILE"
+    elif [ "$kind" = "node_modules" ]; then
+      append_node_modules_action "$target" "removed"
     fi
     log "INFO" "Removed $kind: $target"
   else
-    if [ "$kind" = "malicious artifact" ]; then
+    if [ "$kind" = "node_modules" ]; then
+      append_node_modules_action "$target" "remove-failed"
+    elif [ "$kind" = "malicious artifact" ]; then
       printf '%s\0%s\0' "$target" "remove-failed" >> "$PERSISTENCE_ARTIFACTS_FILE"
     fi
     record_error "Failed to remove $kind: $target"
   fi
 }
 
-scan_node_modules_and_projects() {
-  local root target package_file find_output
+scan_package_manifests() {
+  local root package_file find_output
   while IFS= read -r root; do
     [ -d "$root" ] || { record_error "Scan root is no longer available: $root"; continue; }
     log "INFO" "Scanning filesystem: $root"
 
     find_output="$WORK_DIR/find-$FIND_ATTEMPT_SEQUENCE.bin"
-    run_find_nul "$find_output" "$root" -xdev \( -type d -o -type l \) -name node_modules -prune || true
-    while IFS= read -r -d '' target; do
-      [ "${target##*/}" = "node_modules" ] || { record_error "Safety check rejected unexpected deletion target: $target"; continue; }
-      remove_directory "$target" "node_modules"
-    done < "$find_output"
-
-    find_output="$WORK_DIR/find-$FIND_ATTEMPT_SEQUENCE.bin"
-    run_find_nul "$find_output" "$root" -xdev -type d -name node_modules -prune -o -type f -name package.json || true
+    if [ "$INCLUDE_APPLICATION_DIRS" -eq 1 ]; then
+      run_find_nul "$find_output" "$root" -xdev -type d -name node_modules -prune -o -type f -name package.json || true
+    else
+      run_find_nul "$find_output" "$root" -xdev \
+        \( -type d \( -name node_modules -o "${APPLICATION_DIR_FIND_TEST[@]}" \) -prune \) \
+        -o -type f -name package.json || true
+    fi
     while IFS= read -r -d '' package_file; do
       printf '%s\0' "$package_file" >> "$PACKAGES_FILE"
     done < "$find_output"
   done < "$ROOTS_FILE"
+}
+
+remove_targeted_node_modules() {
+  local target
+  while IFS= read -r -d '' target; do
+    [ "${target##*/}" = "node_modules" ] || { record_error "Safety check rejected unexpected deletion target: $target"; continue; }
+    remove_directory "$target" "node_modules"
+  done < "$NODE_MODULE_TARGETS_FILE"
 }
 
 clean_known_caches() {
@@ -793,8 +874,6 @@ obtain_iocs() {
 scan_manifests() {
   local scanner scan_metadata
   [ -n "$IOC_FILE" ] || return
-  # Cache cleanup happens before manifest parsing. Remove paths that no
-  # longer exist so transient cache entries do not become false parse errors.
   prune_missing_package_paths
   scanner=""
   if [ "${SHAI_HULUD_MANIFEST_PARSER:-auto}" = "node" ] && node_usable; then
@@ -812,13 +891,13 @@ scan_manifests() {
 
   scan_metadata="$WORK_DIR/scan-metadata.json"
   if [ "$scanner" = "python3" ]; then
-    "$scanner" - "$IOC_FILE" "$PACKAGES_FILE" "$FINDINGS_FILE" "$scan_metadata" <<'PY'
+    "$scanner" - "$IOC_FILE" "$PACKAGES_FILE" "$ROOTS_FILE" "$FINDINGS_FILE" "$NODE_MODULE_TARGETS_FILE" "$scan_metadata" <<'PY'
 import csv
 import json
 import os
 import sys
 
-ioc_path, package_list_path, output_path, metadata_path = sys.argv[1:]
+ioc_path, package_list_path, roots_path, output_path, targets_path, metadata_path = sys.argv[1:]
 iocs = {}
 with open(ioc_path, newline="", encoding="utf-8-sig") as handle:
     for row in csv.DictReader(handle):
@@ -828,15 +907,68 @@ with open(ioc_path, newline="", encoding="utf-8-sig") as handle:
             iocs[name] = versions
 
 with open(package_list_path, "rb") as handle:
-    paths = [os.fsdecode(item) for item in handle.read().split(b"\0") if item]
+    paths = list(dict.fromkeys(os.fsdecode(item) for item in handle.read().split(b"\0") if item))
+
+with open(roots_path, encoding="utf-8") as handle:
+    roots = [os.path.abspath(line.rstrip("\n")) for line in handle if line.rstrip("\n")]
 
 sections = ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies")
 rows = []
 parse_errors = []
+targets = set()
 
 def csv_safe(value):
     text = str(value)
     return "'" + text if text.lstrip(" \t\r\n").startswith(("=", "+", "-", "@")) else text
+
+def package_components(name):
+    parts = name.split("/")
+    if name.startswith("@"):
+        return parts if len(parts) == 2 and all(part not in ("", ".", "..") for part in parts) else None
+    return parts if len(parts) == 1 and parts[0] not in ("", ".", "..") else None
+
+def containing_root(path):
+    candidates = []
+    absolute = os.path.abspath(path)
+    for root in roots:
+        try:
+            if os.path.commonpath((absolute, root)) == root:
+                candidates.append(root)
+        except ValueError:
+            continue
+    return max(candidates, key=len) if candidates else None
+
+def installed_locations(manifest_path, package_name, bad_versions):
+    components = package_components(package_name)
+    root = containing_root(manifest_path)
+    if components is None or root is None:
+        return []
+    current = os.path.dirname(os.path.abspath(manifest_path))
+    locations = []
+    while True:
+        node_modules = os.path.join(current, "node_modules")
+        package_path = os.path.join(node_modules, *components)
+        if os.path.lexists(package_path) and (os.path.isdir(node_modules) or os.path.islink(node_modules)):
+            installed_version = "unknown"
+            try:
+                with open(os.path.join(package_path, "package.json"), encoding="utf-8-sig") as handle:
+                    installed_manifest = json.load(handle)
+                value = installed_manifest.get("version") if isinstance(installed_manifest, dict) else None
+                if value is not None and str(value).strip():
+                    installed_version = str(value).strip()
+            except Exception:
+                pass
+            status = "unknown" if installed_version == "unknown" else ("malicious" if installed_version in bad_versions else "not-listed")
+            locations.append((node_modules, installed_version, status))
+            if status in ("malicious", "unknown"):
+                targets.add(node_modules)
+        if current == root:
+            break
+        parent = os.path.dirname(current)
+        if parent == current or os.path.commonpath((parent, root)) != root:
+            break
+        current = parent
+    return locations
 
 for path in paths:
     try:
@@ -854,23 +986,32 @@ for path in paths:
         for name, declared in values.items():
             if name in iocs:
                 declared_text = str(declared)
-                bad_versions = [v.strip() for v in iocs[name].split(",")]
+                bad_versions = [v.strip() for v in iocs[name].split(",") if v.strip()]
                 normalized = declared_text.strip().lstrip("=v")
                 confidence = "exact" if normalized in bad_versions else "review-range"
-                rows.append(tuple(csv_safe(value) for value in (path, section, name, declared_text, iocs[name], confidence)))
+                locations = installed_locations(path, name, bad_versions)
+                modules = " | ".join(item[0] for item in locations)
+                versions = " | ".join(item[1] for item in locations)
+                installed_status = " | ".join(item[2] for item in locations) if locations else "not-installed"
+                rows.append(tuple(csv_safe(value) for value in (path, section, name, declared_text, iocs[name], confidence, modules, versions, installed_status)))
 
 with open(output_path, "w", newline="", encoding="utf-8") as handle:
     writer = csv.writer(handle)
-    writer.writerow(("Manifest", "Section", "Package", "Declared", "Malicious Versions", "Match"))
+    writer.writerow(("Manifest", "Section", "Package", "Declared", "Malicious Versions", "Match", "Node Modules", "Installed Versions", "Installed Status"))
     writer.writerows(rows)
+
+with open(targets_path, "wb") as handle:
+    if targets:
+        handle.write(b"\0".join(os.fsencode(item) for item in sorted(targets)) + b"\0")
 
 with open(metadata_path, "w", encoding="utf-8") as handle:
     json.dump({"packages_scanned": len(paths), "findings": len(rows), "parse_errors": parse_errors}, handle)
 PY
   else
-    "$scanner" - "$IOC_FILE" "$PACKAGES_FILE" "$FINDINGS_FILE" "$scan_metadata" <<'JS'
+    "$scanner" - "$IOC_FILE" "$PACKAGES_FILE" "$ROOTS_FILE" "$FINDINGS_FILE" "$NODE_MODULE_TARGETS_FILE" "$scan_metadata" <<'JS'
 const fs = require('fs');
-const [iocPath, packageListPath, outputPath, metadataPath] = process.argv.slice(2);
+const pathMod = require('path');
+const [iocPath, packageListPath, rootsPath, outputPath, targetsPath, metadataPath] = process.argv.slice(2);
 
 function parseCsv(text) {
   const rows = [];
@@ -907,10 +1048,63 @@ for (const row of csvRows) {
   if (name) iocs.set(name, (row[versionsIndex] || '').trim());
 }
 
-const paths = fs.readFileSync(packageListPath).toString('utf8').split('\0').filter(Boolean);
+const paths = [...new Set(fs.readFileSync(packageListPath).toString('utf8').split('\0').filter(Boolean))];
+const roots = fs.readFileSync(rootsPath, 'utf8').split(/\r?\n/).filter(Boolean).map(root => pathMod.resolve(root));
 const sections = ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'];
 const rows = [];
 const parseErrors = [];
+const targets = new Set();
+
+function packageComponents(name) {
+  const parts = name.split('/');
+  if (name.startsWith('@')) return parts.length === 2 && parts.every(part => part && part !== '.' && part !== '..') ? parts : null;
+  return parts.length === 1 && parts[0] && parts[0] !== '.' && parts[0] !== '..' ? parts : null;
+}
+
+function isWithin(candidate, root) {
+  const relative = pathMod.relative(root, candidate);
+  return relative === '' || (!relative.startsWith('..' + pathMod.sep) && relative !== '..' && !pathMod.isAbsolute(relative));
+}
+
+function containingRoot(candidate) {
+  const absolute = pathMod.resolve(candidate);
+  const candidates = roots.filter(root => isWithin(absolute, root));
+  return candidates.sort((left, right) => right.length - left.length)[0] || null;
+}
+
+function pathExists(candidate) {
+  try { fs.lstatSync(candidate); return true; } catch (error) { return false; }
+}
+
+function installedLocations(manifestPath, packageName, badVersions) {
+  const components = packageComponents(packageName);
+  const root = containingRoot(manifestPath);
+  if (!components || !root) return [];
+  let current = pathMod.dirname(pathMod.resolve(manifestPath));
+  const locations = [];
+  while (true) {
+    const nodeModules = pathMod.join(current, 'node_modules');
+    const packagePath = pathMod.join(nodeModules, ...components);
+    if (pathExists(packagePath) && pathExists(nodeModules)) {
+      let installedVersion = 'unknown';
+      try {
+        const installedManifest = JSON.parse(fs.readFileSync(pathMod.join(packagePath, 'package.json'), 'utf8').replace(/^\uFEFF/, ''));
+        if (installedManifest && typeof installedManifest === 'object' && !Array.isArray(installedManifest) && installedManifest.version != null && String(installedManifest.version).trim()) {
+          installedVersion = String(installedManifest.version).trim();
+        }
+      } catch (error) { /* unknown remains conservatively actionable */ }
+      const status = installedVersion === 'unknown' ? 'unknown' : (badVersions.includes(installedVersion) ? 'malicious' : 'not-listed');
+      locations.push([nodeModules, installedVersion, status]);
+      if (status === 'malicious' || status === 'unknown') targets.add(nodeModules);
+    }
+    if (current === root) break;
+    const parent = pathMod.dirname(current);
+    if (parent === current || !isWithin(parent, root)) break;
+    current = parent;
+  }
+  return locations;
+}
+
 for (const manifestPath of paths) {
   let manifest;
   try {
@@ -925,16 +1119,21 @@ for (const manifestPath of paths) {
       if (!iocs.has(name)) continue;
       const declared = String(declaredValue);
       const malicious = iocs.get(name);
-      const badVersions = malicious.split(',').map(value => value.trim());
+      const badVersions = malicious.split(',').map(value => value.trim()).filter(Boolean);
       const normalized = declared.trim().replace(/^[=v]+/, '');
       const confidence = badVersions.includes(normalized) ? 'exact' : 'review-range';
-      rows.push([manifestPath, section, name, declared, malicious, confidence]);
+      const locations = installedLocations(manifestPath, name, badVersions);
+      const nodeModules = locations.map(item => item[0]).join(' | ');
+      const installedVersions = locations.map(item => item[1]).join(' | ');
+      const installedStatus = locations.length ? locations.map(item => item[2]).join(' | ') : 'not-installed';
+      rows.push([manifestPath, section, name, declared, malicious, confidence, nodeModules, installedVersions, installedStatus]);
     }
   }
 }
 
-const reportRows = [['Manifest', 'Section', 'Package', 'Declared', 'Malicious Versions', 'Match'], ...rows];
+const reportRows = [['Manifest', 'Section', 'Package', 'Declared', 'Malicious Versions', 'Match', 'Node Modules', 'Installed Versions', 'Installed Status'], ...rows];
 fs.writeFileSync(outputPath, reportRows.map(row => row.map(csvField).join(',')).join('\n') + '\n', 'utf8');
+fs.writeFileSync(targetsPath, targets.size ? [...targets].sort().join('\0') + '\0' : '', 'utf8');
 fs.writeFileSync(metadataPath, JSON.stringify({packages_scanned: paths.length, findings: rows.length, parse_errors: parseErrors}), 'utf8');
 JS
   fi
@@ -1053,19 +1252,48 @@ scan_ide_persistence() {
     [ -d "$root" ] || { record_error "Persistence scan root is no longer available: $root"; continue; }
 
     find_output="$WORK_DIR/find-$FIND_ATTEMPT_SEQUENCE.bin"
-    run_find_nul "$find_output" "$root" -xdev -type d -name node_modules -prune -o -type f \( -path '*/.claude/settings.json' -o -path '*/.vscode/tasks.json' \) || true
-    while IFS= read -r -d '' hook_file; do
-      printf '%s\0' "$hook_file" >> "$HOOKS_FILE"
-    done < "$find_output"
+    if [ "$INCLUDE_APPLICATION_DIRS" -eq 1 ]; then
+      run_find_nul "$find_output" "$root" -xdev -type d -name node_modules -prune -o -type f \( -path '*/.claude/settings.json' -o -path '*/.vscode/tasks.json' \) || true
+      while IFS= read -r -d '' hook_file; do
+        printf '%s\0' "$hook_file" >> "$HOOKS_FILE"
+      done < "$find_output"
+    else
+      # Emit each workspace IDE directory itself, then derive the one config
+      # file we inspect. This finds the narrow persistence surface without
+      # descending through IDE extension/application state.
+      run_find_nul "$find_output" "$root" -xdev \
+        \( -type d \( -name node_modules -o "${APPLICATION_DIR_EXCEPT_IDE_FIND_TEST[@]}" \) -prune \) \
+        -o \( -type d \( -name .claude -o -name .vscode \) -prune \) || true
+      while IFS= read -r -d '' hook_file; do
+        case "${hook_file##*/}" in
+          .claude) hook_file="$hook_file/settings.json" ;;
+          .vscode) hook_file="$hook_file/tasks.json" ;;
+          *) continue ;;
+        esac
+        [ -f "$hook_file" ] && [ ! -L "$hook_file" ] && printf '%s\0' "$hook_file" >> "$HOOKS_FILE"
+      done < "$find_output"
+    fi
 
     find_output="$WORK_DIR/find-$FIND_ATTEMPT_SEQUENCE.bin"
-    run_find_nul "$find_output" "$root" -xdev -type d -name node_modules -prune -o -type f \( -name 'Math_Symbol.js' -o -name 'math_init.js' \) || true
+    if [ "$INCLUDE_APPLICATION_DIRS" -eq 1 ]; then
+      run_find_nul "$find_output" "$root" -xdev -type d -name node_modules -prune -o -type f \( -name 'Math_Symbol.js' -o -name 'math_init.js' \) || true
+    else
+      run_find_nul "$find_output" "$root" -xdev \
+        \( -type d \( -name node_modules -o "${APPLICATION_DIR_FIND_TEST[@]}" \) -prune \) \
+        -o -type f \( -name 'Math_Symbol.js' -o -name 'math_init.js' \) || true
+    fi
     while IFS= read -r -d '' payload_file; do
       remove_directory "$payload_file" "malicious artifact"
     done < "$find_output"
 
     find_output="$WORK_DIR/find-$FIND_ATTEMPT_SEQUENCE.bin"
-    run_find_nul "$find_output" "$root" -xdev -type d -name 'bun-dl-*' -prune || true
+    if [ "$INCLUDE_APPLICATION_DIRS" -eq 1 ]; then
+      run_find_nul "$find_output" "$root" -xdev -type d -name 'bun-dl-*' -prune || true
+    else
+      run_find_nul "$find_output" "$root" -xdev \
+        \( -type d \( "${APPLICATION_DIR_FIND_TEST[@]}" \) -prune \) \
+        -o -type d -name 'bun-dl-*' -prune || true
+    fi
     while IFS= read -r -d '' payload_dir; do
       remove_directory "$payload_dir" "malicious artifact"
     done < "$find_output"
@@ -1453,33 +1681,35 @@ discover_homes
 dedupe_path_file "$HOMES_FILE"
 discover_roots
 dedupe_path_file "$ROOTS_FILE"
-SYSTEM_NPM_CONFIG="$(resolve_npm_global_config)"
 
 log "INFO" "Shai Hulud remediation v$VERSION started (mode=$MODE, host=$(hostname 2>/dev/null || printf unknown), os=$OS_NAME)"
 log "INFO" "Report: $REPORT_FILE"
+[ "$INCLUDE_APPLICATION_DIRS" -eq 0 ] && log "INFO" "Known application and tool-state directories are excluded from traversal"
 [ "$MODE" = "remediate" ] && log "INFO" "Restricted configuration backups: $CONFIG_BACKUP_DIR"
 
 obtain_iocs
 if [ -n "$IOC_FILE" ]; then
-  scan_node_modules_and_projects
-  clean_known_caches
-  clean_project_caches
-  prune_missing_package_paths
-  enforce_script_blocking
-  verify_package_manager_controls
-  scan_ide_persistence
+  scan_package_manifests
   scan_manifests
+  remove_targeted_node_modules
+  scan_ide_persistence
 else
   log "ERROR" "IOC data is unavailable; no cleanup or configuration changes were attempted"
 fi
 
 if [ ! -f "$FINDINGS_FILE" ]; then
-  printf 'Manifest,Section,Package,Declared,Malicious Versions,Match\n' > "$FINDINGS_FILE"
+  printf 'Manifest,Section,Package,Declared,Malicious Versions,Match,Node Modules,Installed Versions,Installed Status\n' > "$FINDINGS_FILE"
 fi
 if cp -- "$FINDINGS_FILE" "$FINAL_FINDINGS_FILE"; then
   log "INFO" "Dependency report: $FINAL_FINDINGS_FILE"
 else
   record_error "Could not publish dependency report: $FINAL_FINDINGS_FILE"
+fi
+
+if cp -- "$REMOVALS_FILE" "$FINAL_REMOVALS_FILE"; then
+  log "INFO" "Node modules action report: $FINAL_REMOVALS_FILE"
+else
+  record_error "Could not publish node_modules action report: $FINAL_REMOVALS_FILE"
 fi
 
 if [ -s "$PERSISTENCE_CSV" ]; then

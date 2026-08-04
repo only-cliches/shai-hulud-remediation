@@ -4,8 +4,10 @@
 Unattended Shai Hulud / Keyv supply-chain remediation for Windows.
 
 .DESCRIPTION
-Remediation is the default. Use -AuditOnly for a read-only assessment. The
-script is designed for SYSTEM execution by RMM and EDR tools and never prompts.
+Remediation is the default. It inventories manifests first and removes only
+dependency trees containing an actionable top-level IOC package. Use
+-AuditOnly for a read-only assessment. The script is designed for SYSTEM
+execution by RMM and EDR tools and never prompts.
 #>
 [CmdletBinding()]
 param(
@@ -13,12 +15,13 @@ param(
     [string]$IocFile,
     [string]$ReportDirectory,
     [string]$BackupDirectory,
-    [string[]]$ScanRoot
+    [string[]]$ScanRoot,
+    [switch]$IncludeApplicationDirectories
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Continue'
-$ToolVersion = '2.2.1'
+$ToolVersion = '3.0.0'
 $IocUrl = 'https://raw.githubusercontent.com/wiz-sec-public/wiz-research-iocs/refs/heads/main/reports/keyv-packages.csv'
 $Mode = if ($AuditOnly) { 'audit' } else { 'remediate' }
 $CustomScope = $null -ne $ScanRoot -and $ScanRoot.Count -gt 0
@@ -51,6 +54,48 @@ function Test-IsSafeDirectoryPath {
         $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
         return $item.PSIsContainer -and (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)
     } catch { return $false }
+}
+
+function Test-IsKnownApplicationDirectory {
+    param([string]$Path)
+    if ($script:IncludeApplicationDirectories) { return $false }
+    try {
+        $trimCharacters = [char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+        $fullPath = [IO.Path]::GetFullPath($Path).TrimEnd($trimCharacters)
+        $leaf = [IO.Path]::GetFileName($fullPath)
+        $knownNames = @(
+            'AppData', 'Application Data', 'Local Settings', 'Applications', 'Programs', 'scoop',
+            '.cache', '.config', '.local', '.npm', '.pnpm-store', '.yarn', '.bun', '.corepack',
+            '.nvm', '.fnm', '.volta', '.asdf', '.nodenv', '.node-gyp',
+            '.vscode', '.vscode-insiders', '.vscode-oss', '.vscode-server', '.vscode-server-insiders',
+            '.cursor', '.cursor-server', '.windsurf', '.windsurf-server', '.claude', '.codex', '.opencode'
+        )
+        if ($knownNames -icontains $leaf) { return $true }
+
+        foreach ($systemPath in @($env:windir, $env:ProgramFiles, [Environment]::GetEnvironmentVariable('ProgramFiles(x86)'), $env:ProgramData)) {
+            if ([string]::IsNullOrWhiteSpace($systemPath)) { continue }
+            $normalizedSystemPath = [IO.Path]::GetFullPath($systemPath).TrimEnd($trimCharacters)
+            if ($fullPath -ieq $normalizedSystemPath) { return $true }
+        }
+    } catch {
+        return $false
+    }
+    return $false
+}
+
+function Add-IdeConfigurationFromDirectory {
+    param([string]$Directory)
+    $leaf = Split-Path -Leaf $Directory
+    $ideConfig = $null
+    if ($leaf -ieq '.claude') { $ideConfig = Join-Path $Directory 'settings.json' }
+    elseif ($leaf -ieq '.vscode') { $ideConfig = Join-Path $Directory 'tasks.json' }
+    if ($null -eq $ideConfig -or -not [IO.File]::Exists($ideConfig)) { return }
+    try {
+        $configItem = Get-Item -LiteralPath $ideConfig -Force -ErrorAction Stop
+        if (($configItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -and -not $configItem.PSIsContainer) {
+            [void]$script:IdeConfigFiles.Add($configItem.FullName)
+        }
+    } catch { Add-OperationalError "Could not inspect IDE persistence config '$ideConfig': $($_.Exception.Message)" }
 }
 
 $IsAdministrator = Test-IsAdministrator
@@ -121,6 +166,7 @@ $RunId = '{0}-{1}' -f ([DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ')), $PID
 $ReportFile = Join-Path $ReportDirectory "Shai-Hulud-Remediation-$RunId.log"
 $SummaryFile = Join-Path $ReportDirectory "Shai-Hulud-Remediation-$RunId.json"
 $FindingsFile = Join-Path $ReportDirectory "Shai-Hulud-Dependencies-$RunId.csv"
+$NodeModulesFile = Join-Path $ReportDirectory "Shai-Hulud-NodeModules-$RunId.csv"
 $PersistenceFile = Join-Path $ReportDirectory "Shai-Hulud-Persistence-$RunId.csv"
 $UsingDefaultBackupDirectory = [string]::IsNullOrWhiteSpace($BackupDirectory)
 if ($UsingDefaultBackupDirectory) {
@@ -132,6 +178,8 @@ $ConfigBackupManifest = Join-Path $ConfigBackupDirectory "manifest.tsv"
 $ConfigBackupSequence = 0
 $IdeConfigFiles = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
 $PersistenceEvents = New-Object 'System.Collections.Generic.List[object]'
+$NodeModulesEvents = New-Object 'System.Collections.Generic.List[object]'
+$VulnerableNodeModules = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
 $WorkingDirectory = Join-Path ([IO.Path]::GetTempPath()) "shai-hulud-$([Guid]::NewGuid().ToString('N'))"
 try {
     [void][IO.Directory]::CreateDirectory($WorkingDirectory)
@@ -178,6 +226,14 @@ function Add-PersistenceEvent {
         Kind = $Kind
         Event = $Event
         Command = $Command
+        Action = $Action
+    })
+}
+
+function Add-NodeModulesEvent {
+    param([string]$Path, [string]$Action)
+    $script:NodeModulesEvents.Add([PSCustomObject][ordered]@{
+        'Node Modules' = $Path
         Action = $Action
     })
 }
@@ -230,6 +286,7 @@ function Remove-RemediationDirectory {
     }
     if ($Kind -eq 'node_modules') { $script:Stats.node_modules_found++ } else { $script:Stats.caches_found++ }
     if ($script:Mode -eq 'audit') {
+        if ($Kind -eq 'node_modules') { Add-NodeModulesEvent $Path 'would-remove' }
         Write-Log 'AUDIT' "Would remove ${Kind}: $Path"
         return
     }
@@ -240,9 +297,13 @@ function Remove-RemediationDirectory {
             Remove-Item -LiteralPath $Path -Force -Recurse -ErrorAction Stop
         }
         if (Test-Path -LiteralPath $Path) { throw 'Target still exists after removal' }
-        if ($Kind -eq 'node_modules') { $script:Stats.node_modules_removed++ } else { $script:Stats.caches_removed++ }
+        if ($Kind -eq 'node_modules') {
+            $script:Stats.node_modules_removed++
+            Add-NodeModulesEvent $Path 'removed'
+        } else { $script:Stats.caches_removed++ }
         Write-Log 'INFO' "Removed ${Kind}: $Path"
     } catch {
+        if ($Kind -eq 'node_modules') { Add-NodeModulesEvent $Path 'remove-failed' }
         Add-OperationalError "Failed to remove $Kind '$Path': $($_.Exception.Message)"
     }
 }
@@ -309,25 +370,26 @@ function Get-TreeInventory {
     $manifests = New-Object 'System.Collections.Generic.List[string]'
     foreach ($root in $Roots) {
         if (-not (Test-IsSafeDirectoryPath $root)) { Add-OperationalError "Refusing to scan missing or reparse-point root '$root'"; continue }
+        if (Test-IsKnownApplicationDirectory $root) {
+            Add-IdeConfigurationFromDirectory $root
+            Write-Log 'INFO' "Skipping known application directory: $root"
+            continue
+        }
         Write-Log 'INFO' "Scanning filesystem: $root"
         $stack = New-Object 'System.Collections.Generic.Stack[string]'
         $stack.Push($root)
         while ($stack.Count -gt 0) {
             $current = $stack.Pop()
             $manifest = Join-Path $current 'package.json'
-            if ([IO.File]::Exists($manifest)) { [void]$manifests.Add($manifest) }
-            $currentLeaf = Split-Path -Leaf $current
-            $ideConfig = $null
-            if ($currentLeaf -ieq '.claude') { $ideConfig = Join-Path $current 'settings.json' }
-            elseif ($currentLeaf -ieq '.vscode') { $ideConfig = Join-Path $current 'tasks.json' }
-            if ($null -ne $ideConfig -and [IO.File]::Exists($ideConfig)) {
+            if ([IO.File]::Exists($manifest)) {
                 try {
-                    $configItem = Get-Item -LiteralPath $ideConfig -Force -ErrorAction Stop
-                    if (($configItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -and -not $configItem.PSIsContainer) {
-                        [void]$script:IdeConfigFiles.Add($configItem.FullName)
+                    $manifestItem = Get-Item -LiteralPath $manifest -Force -ErrorAction Stop
+                    if (($manifestItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -and -not $manifestItem.PSIsContainer) {
+                        [void]$manifests.Add($manifestItem.FullName)
                     }
-                } catch { Add-OperationalError "Could not inspect IDE persistence config '$ideConfig': $($_.Exception.Message)" }
+                } catch { Add-OperationalError "Could not inspect package manifest '$manifest': $($_.Exception.Message)" }
             }
+            Add-IdeConfigurationFromDirectory $current
             foreach ($payloadName in @('Math_Symbol.js', 'math_init.js')) {
                 $payloadPath = Join-Path $current $payloadName
                 if ([IO.File]::Exists($payloadPath)) { Remove-MaliciousArtifact $payloadPath }
@@ -336,15 +398,13 @@ function Get-TreeInventory {
                 foreach ($directoryPath in [IO.Directory]::EnumerateDirectories($current)) {
                     $directory = New-Object IO.DirectoryInfo($directoryPath)
                     if ($directory.Name -ieq 'node_modules') {
-                        Remove-RemediationDirectory $directory.FullName 'node_modules'
-                        continue
-                    }
-                    if ($directory.Name -ieq '.pnpm-store' -or
-                        ($directory.Name -ieq 'cache' -and $directory.Parent.Name -ieq '.yarn')) {
-                        Remove-RemediationDirectory $directory.FullName 'project package cache'
                         continue
                     }
                     if (($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+                    if (Test-IsKnownApplicationDirectory $directory.FullName) {
+                        Add-IdeConfigurationFromDirectory $directory.FullName
+                        continue
+                    }
                     if ($directory.Name -like 'bun-dl-*') {
                         Remove-MaliciousArtifact $directory.FullName
                         continue
@@ -830,8 +890,68 @@ function Get-IocRows {
     } catch { Add-OperationalError "Invalid IOC CSV '$path': $($_.Exception.Message)"; return @() }
 }
 
+function Test-PathWithinRoot {
+    param([string]$Path, [string]$Root)
+    try {
+        $candidate = [IO.Path]::GetFullPath($Path)
+        $rootPath = [IO.Path]::GetFullPath($Root)
+        if ($candidate.Equals($rootPath, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+        $separator = [string][IO.Path]::DirectorySeparatorChar
+        $prefix = if ($rootPath.EndsWith($separator, [StringComparison]::Ordinal)) { $rootPath } else { $rootPath + $separator }
+        return $candidate.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)
+    } catch { return $false }
+}
+
+function Get-InstalledDependencyLocations {
+    param(
+        [string]$ManifestPath,
+        [string]$PackageName,
+        [string[]]$BadVersions,
+        [string[]]$Roots
+    )
+    $parts = @($PackageName -split '/')
+    $validName = if ($PackageName.StartsWith('@')) { $parts.Count -eq 2 } else { $parts.Count -eq 1 }
+    $invalidParts = @($parts | Where-Object { [string]::IsNullOrWhiteSpace($_) -or $_ -eq '.' -or $_ -eq '..' })
+    if (-not $validName -or $invalidParts.Count -gt 0) { return @() }
+
+    $manifestDirectory = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($ManifestPath))
+    $containingRoots = @($Roots | Where-Object { Test-PathWithinRoot $manifestDirectory $_ } | Sort-Object { $_.Length } -Descending)
+    if ($containingRoots.Count -eq 0) { return @() }
+    $root = [IO.Path]::GetFullPath($containingRoots[0])
+    $current = $manifestDirectory
+    $locations = New-Object 'System.Collections.Generic.List[object]'
+
+    while ($true) {
+        $nodeModules = Join-Path $current 'node_modules'
+        $packagePath = $nodeModules
+        foreach ($part in $parts) { $packagePath = Join-Path $packagePath $part }
+        if (([IO.Directory]::Exists($nodeModules) -or (Test-Path -LiteralPath $nodeModules)) -and (Test-Path -LiteralPath $packagePath)) {
+            $installedVersion = 'unknown'
+            try {
+                $installedManifestPath = Join-Path $packagePath 'package.json'
+                $installedManifest = [IO.File]::ReadAllText($installedManifestPath) | ConvertFrom-Json -ErrorAction Stop
+                if ($null -ne $installedManifest -and $null -ne $installedManifest.PSObject.Properties['version'] -and -not [string]::IsNullOrWhiteSpace([string]$installedManifest.version)) {
+                    $installedVersion = ([string]$installedManifest.version).Trim()
+                }
+            } catch {}
+            $status = if ($installedVersion -eq 'unknown') { 'unknown' } elseif ($BadVersions -contains $installedVersion) { 'malicious' } else { 'not-listed' }
+            $locations.Add([PSCustomObject][ordered]@{
+                NodeModules = $nodeModules
+                InstalledVersion = $installedVersion
+                Status = $status
+            })
+            if ($status -eq 'malicious' -or $status -eq 'unknown') { [void]$script:VulnerableNodeModules.Add($nodeModules) }
+        }
+        if ($current.Equals($root, [StringComparison]::OrdinalIgnoreCase)) { break }
+        $parent = [IO.Directory]::GetParent($current)
+        if ($null -eq $parent -or -not (Test-PathWithinRoot $parent.FullName $root)) { break }
+        $current = $parent.FullName
+    }
+    return $locations
+}
+
 function Find-VulnerableDeclarations {
-    param([string[]]$Manifests, $IocRows)
+    param([string[]]$Manifests, $IocRows, [string[]]$Roots)
     $iocMap = @{}
     foreach ($row in $IocRows) { $iocMap[[string]$row.Package] = [string]$row.'Malicious Versions' }
     $findings = New-Object 'System.Collections.Generic.List[object]'
@@ -857,6 +977,7 @@ function Find-VulnerableDeclarations {
                 $badVersions = @($iocMap[$dependency.Name] -split ',' | ForEach-Object { $_.Trim() })
                 $normalized = $declared.Trim().TrimStart('=','v')
                 $confidence = if ($badVersions -contains $normalized) { 'exact' } else { 'review-range' }
+                $locations = @(Get-InstalledDependencyLocations $manifestPath $dependency.Name $badVersions $Roots)
                 $findings.Add([PSCustomObject][ordered]@{
                     Manifest = $manifestPath
                     Section = $section
@@ -864,6 +985,9 @@ function Find-VulnerableDeclarations {
                     Declared = $declared
                     'Malicious Versions' = $iocMap[$dependency.Name]
                     Match = $confidence
+                    'Node Modules' = (@($locations | ForEach-Object { $_.NodeModules }) -join ' | ')
+                    'Installed Versions' = (@($locations | ForEach-Object { $_.InstalledVersion }) -join ' | ')
+                    'Installed Status' = if ($locations.Count -gt 0) { @($locations | ForEach-Object { $_.Status }) -join ' | ' } else { 'not-installed' }
                 })
             }
         }
@@ -883,7 +1007,7 @@ function Export-DependencyFindings {
     param([object[]]$Findings, [string]$Path)
     $validFindings = @($Findings | Where-Object { $null -ne $_ -and $null -ne $_.PSObject.Properties['Manifest'] })
     if ($validFindings.Count -eq 0) {
-        [IO.File]::WriteAllText($Path, '"Manifest","Section","Package","Declared","Malicious Versions","Match"' + [Environment]::NewLine, (New-Object Text.UTF8Encoding($false)))
+        [IO.File]::WriteAllText($Path, '"Manifest","Section","Package","Declared","Malicious Versions","Match","Node Modules","Installed Versions","Installed Status"' + [Environment]::NewLine, (New-Object Text.UTF8Encoding($false)))
         return
     }
     $validFindings | ForEach-Object {
@@ -894,6 +1018,24 @@ function Export-DependencyFindings {
             Declared = ConvertTo-CsvSafeValue $_.Declared
             'Malicious Versions' = ConvertTo-CsvSafeValue $_.'Malicious Versions'
             Match = ConvertTo-CsvSafeValue $_.Match
+            'Node Modules' = ConvertTo-CsvSafeValue $_.'Node Modules'
+            'Installed Versions' = ConvertTo-CsvSafeValue $_.'Installed Versions'
+            'Installed Status' = ConvertTo-CsvSafeValue $_.'Installed Status'
+        }
+    } | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8 -Force -ErrorAction Stop
+}
+
+function Export-NodeModulesEvents {
+    param([object[]]$Events, [string]$Path)
+    $validEvents = @($Events | Where-Object { $null -ne $_ -and $null -ne $_.PSObject.Properties['Node Modules'] })
+    if ($validEvents.Count -eq 0) {
+        [IO.File]::WriteAllText($Path, '"Node Modules","Action"' + [Environment]::NewLine, (New-Object Text.UTF8Encoding($false)))
+        return
+    }
+    $validEvents | ForEach-Object {
+        [PSCustomObject][ordered]@{
+            'Node Modules' = ConvertTo-CsvSafeValue $_.'Node Modules'
+            Action = ConvertTo-CsvSafeValue $_.Action
         }
     } | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8 -Force -ErrorAction Stop
 }
@@ -919,6 +1061,7 @@ function Export-PersistenceEvents {
 try {
     Write-Log 'INFO' "Shai Hulud remediation v$ToolVersion started (mode=$Mode, host=$env:COMPUTERNAME, user=$env:USERNAME)"
     Write-Log 'INFO' "Report: $ReportFile"
+    if (-not $IncludeApplicationDirectories) { Write-Log 'INFO' 'Known application and tool-state directories are excluded from traversal' }
     if ($Mode -eq 'remediate') { Write-Log 'INFO' "Restricted configuration backups: $ConfigBackupDirectory" }
     $IocRows = @(Get-IocRows)
     $Findings = @()
@@ -929,11 +1072,9 @@ try {
             Add-OperationalError 'No scan roots were discovered; no cleanup or configuration changes were attempted.'
         } else {
             $Manifests = @(Get-TreeInventory $Roots | Select-Object -Unique)
-            Remove-KnownCaches $Profiles
-            Protect-LifecycleScripts $Profiles $Manifests
-            Verify-PackageManagerControls $Profiles $Manifests
+            $Findings = @(Find-VulnerableDeclarations $Manifests $IocRows $Roots)
+            foreach ($nodeModules in $VulnerableNodeModules) { Remove-RemediationDirectory $nodeModules 'node_modules' }
             Remove-IdePersistence @($IdeConfigFiles)
-            $Findings = @(Find-VulnerableDeclarations $Manifests $IocRows)
         }
     } else {
         Write-Log 'ERROR' 'IOC data is unavailable; no cleanup or configuration changes were attempted'
@@ -942,6 +1083,10 @@ try {
         Export-DependencyFindings $Findings $FindingsFile
         Write-Log 'INFO' "Dependency report: $FindingsFile"
     } catch { Add-OperationalError "Could not publish dependency report: $($_.Exception.Message)" }
+    try {
+        Export-NodeModulesEvents -Events @($NodeModulesEvents.ToArray()) -Path $NodeModulesFile
+        Write-Log 'INFO' "Node modules action report: $NodeModulesFile"
+    } catch { Add-OperationalError "Could not publish node_modules action report: $($_.Exception.Message)" }
     try {
         Export-PersistenceEvents -Events @($PersistenceEvents.ToArray()) -Path $PersistenceFile
         Write-Log 'INFO' "Persistence report: $PersistenceFile"

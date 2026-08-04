@@ -6,21 +6,18 @@ The scripts are designed for non-interactive execution from NinjaOne, CrowdStrik
 
 For incident background and additional campaign indicators, see [JFrog Security Research: Major Shai Hulud campaign strikes npm again](https://research.jfrog.com/post/shai-hulud-is-back-august/).
 
-> **Destructive operation:** remediation removes dependency trees, package caches, and incident-specific payload artifacts, and may modify package-manager and IDE configuration files inside source repositories, leaving working trees dirty. Stop Node applications and pause build agents before deployment. Applications must reinstall their dependencies afterward. Deleted dependency trees, caches, and payload artifacts are not backed up; modified configuration files are backed up.
+> **Destructive operation:** remediation removes only `node_modules` trees containing a top-level IOC package whose installed version is malicious or cannot be verified, plus incident-specific payload artifacts. It may modify matched IDE configuration files inside source repositories. Stop affected Node applications and pause affected build agents before deployment. Deleted dependency trees and payload artifacts are not backed up; modified IDE configuration files are backed up.
 
 ## Remediation workflow
 
 Both Windows & MacOS/Linux implementations perform the following workflow:
 
-1. Obtain and validate the IOC CSV before making endpoint changes. If IOC acquisition fails, the run exits with an operational error without performing cleanup or changing package-manager policy.
-2. Scan discovered user profiles and common CI/build roots without following symlinks or Windows reparse points. macOS/Linux traversal stays on each selected filesystem; pass mounted workspaces as additional scan roots when needed.
-3. Remove every `node_modules`, project `.yarn/cache`, and project `.pnpm-store` beneath the selected roots. Full-scope runs also clear known npm, pnpm, Yarn, Bun, Corepack, and node-gyp user/system caches, including the historical `~/.pnpm-store` location.
-4. Remove Claude Code hooks and VS Code tasks that reference the incident payloads (`setup.mjs`, `Math_Symbol.js`, `math_init.js`, or `bun-dl-*`) while preserving unrelated hooks, tasks, and settings. Remove `Math_Symbol.js`, `math_init.js`, and `bun-dl-*` artifacts by their incident-specific names; remove `setup.mjs` only when a matched hook or task references it.
-5. Disable third-party dependency lifecycle scripts at machine, profile, and discovered-project scope. The machine-scope npm/pnpm block is written to the resolved global npmrc and to the `etc/npmrc` of every discovered Node prefix (Homebrew, fnm, nvm, asdf, volta, n, nodenv, source builds), since a prefix-installed Node never reads `/etc/npmrc`; this also covers Nodes reinstalled into those prefixes afterward. Existing `pnpm-workspace.yaml` files receive `ignoreScripts: true`; project-local files are included because they can override profile policy.
-6. Verify the files and Windows machine environment values that were actually changed. Verification does not depend on the RMM account's current working directory or installed package-manager shims.
-7. Report IOC package declarations and IDE-persistence activity, and write log, CSV, and JSON output suitable for RMM collection.
-
-The lifecycle controls are intentionally persistent until an administrator rolls them back. Modern Yarn's `enableScripts: false` blocks third-party package postinstall scripts but does not suppress workspace postinstall scripts; use `yarn install --mode=skip-builds` when workspace scripts must also be skipped.
+1. Obtain and validate the IOC CSV before making endpoint changes. If IOC acquisition fails, the run exits with an operational error without performing cleanup.
+2. Scan every `package.json` beneath discovered user profiles and common CI/build roots, while pruning existing `node_modules`, known application/tool-state directories, symlinks, and Windows reparse points. macOS/Linux traversal stays on each selected filesystem; pass mounted workspaces as additional scan roots when needed.
+3. Report direct IOC package declarations and inspect matching packages installed at the top level of the manifest's local or ancestor `node_modules`. Known malicious installed versions and packages whose installed metadata cannot be verified are actionable; known versions absent from the IOC version list are reported but retained.
+4. Remove only the actionable containing `node_modules` directories. Unrelated dependency trees and npm, pnpm, Yarn, Bun, Corepack, and node-gyp caches are left intact.
+5. Remove Claude Code hooks and VS Code tasks that reference the incident payloads (`setup.mjs`, `Math_Symbol.js`, `math_init.js`, or `bun-dl-*`) while preserving unrelated hooks, tasks, and settings. Remove `Math_Symbol.js`, `math_init.js`, and `bun-dl-*` artifacts by their incident-specific names; remove `setup.mjs` only when a matched hook or task references it.
+6. Write dependency, `node_modules` action, persistence, log, and JSON reports suitable for RMM collection.
 
 ## Automated deployment
 
@@ -48,7 +45,7 @@ Recommended rollout:
 2. Run targeted remediation against a disposable fixture or test workspace.
 3. Pause build agents and applications that use Node dependencies.
 4. Deploy full remediation and collect the JSON summary plus logs.
-5. Review IOC declarations, update affected manifests and lockfiles, then reinstall dependencies while lifecycle scripts remain disabled.
+5. Review IOC declarations, update affected manifests and lockfiles, then reinstall only the removed dependency trees from trusted lockfiles.
 
 ## Scope and targeted testing
 
@@ -59,9 +56,18 @@ Default scope includes:
 - corresponding named CI roots on every Windows fixed drive; and
 - Windows profiles discovered from the registry and `Users` directory.
 
-The default deliberately does not sweep every directory on every fixed disk, which avoids deleting dependencies embedded in unrelated installed applications. Add each additional application or mounted workspace explicitly with a repeatable `--scan-root` or a PowerShell array passed to `-ScanRoot`.
+The default deliberately does not sweep every directory on every fixed disk. Within selected roots, it also prunes known application and tool-owned state so dependencies embedded in installed applications, IDE extensions, and caches are not treated as source workspaces:
 
-Targeted runs do not require elevation. They remove dependency trees/project caches and update package-manager configuration only beside `package.json` files beneath the supplied roots. They do not clear profile/system caches or change machine-wide policy.
+- all platforms: common cache/package/runtime-manager state (`.cache`, `.config`, `.local`, `.npm`, `.pnpm-store`, `.yarn`, `.bun`, `.corepack`, `.nvm`, `.fnm`, `.volta`, `.asdf`, `.nodenv`, and `.node-gyp`), IDE/agent state (`.vscode*`, `.cursor*`, `.windsurf*`, `.claude`, `.codex`, and `.opencode`), and `Applications`;
+- macOS: `Library`, application bundles (`*.app`), `/System`, `/Library`, and `/Applications`;
+- Linux: `.var`, `snap`, `/usr`, `/opt`, `/snap`, `/var/lib`, `/var/cache`, and `/var/snap`; and
+- Windows: `AppData`, `Application Data`, `Local Settings`, `Programs`, `scoop`, Windows, Program Files, and ProgramData roots.
+
+The scripts still inspect workspace `.claude/settings.json` and `.vscode/tasks.json` for the narrow incident-persistence patterns, but they do not descend into those directories for dependency or payload cleanup. To investigate application-owned trees deliberately, add `--include-application-dirs` or `-IncludeApplicationDirectories`. Use that override only with tightly bounded scan roots: it can remove an application or IDE extension's `node_modules` when the installed top-level version is actionable.
+
+Add each additional mounted workspace explicitly with a repeatable `--scan-root` or a PowerShell array passed to `-ScanRoot`.
+
+Targeted runs do not require elevation. They use the same evidence-driven behavior beneath only the supplied roots: unrelated dependency trees and package caches are retained, and package-manager configuration is not changed.
 
 ```bash
 /bin/bash ./scripts/remediate-shai-hulud.sh \
@@ -79,7 +85,7 @@ Targeted runs do not require elevation. They remove dependency trees/project cac
   -IocFile .\keyv-packages.csv
 ```
 
-Audit mode inventories the same scope but does not delete caches, dependencies, or payloads, and does not change package-manager or IDE configuration. It still writes reports, which is the only intentional endpoint mutation:
+Audit mode inventories the same scope but does not delete targeted dependency trees or payloads, and does not change IDE configuration. It still writes reports, which is the only intentional endpoint mutation:
 
 ```bash
 /bin/bash ./scripts/remediate-shai-hulud.sh --audit-only --ioc-file ./keyv-packages.csv
@@ -104,11 +110,12 @@ If a non-elevated Unix run cannot use `$HOME`, it allocates a private temporary 
 Each run writes:
 
 - `Shai-Hulud-Remediation-<run-id>.log` — activity, warnings, and errors;
-- `Shai-Hulud-Dependencies-<run-id>.csv` — matching dependency declarations;
+- `Shai-Hulud-Dependencies-<run-id>.csv` — matching declarations, associated top-level installations, installed versions, and disposition status;
+- `Shai-Hulud-NodeModules-<run-id>.csv` — each targeted dependency tree and whether it was removed, would be removed in audit mode, or failed removal;
 - `Shai-Hulud-Persistence-<run-id>.csv` — IDE hooks, tasks, payload artifacts, parse failures, and the action taken or proposed; and
 - `Shai-Hulud-Remediation-<run-id>.json` — stable fields for RMM ingestion.
 
-Remediation runs also create `manifest.tsv` in the restricted backup directory. Package-manager files and IDE configuration files are backed up before modification. Backups use short sequence names, avoiding path collisions and component-length failures. Manifest actions are:
+Remediation runs also create `manifest.tsv` in the restricted backup directory. IDE configuration files are backed up before modification. Backups use short sequence names, avoiding path collisions and component-length failures. Manifest actions are:
 
 | Action | Rollback meaning |
 | --- | --- |
@@ -117,9 +124,9 @@ Remediation runs also create `manifest.tsv` in the restricted backup directory. 
 | `RESTORE_ENV` | Restore the Windows machine variable to the Base64-encoded UTF-8 value |
 | `DELETE_ENV` | The Windows machine variable did not exist; remove it during rollback |
 
-Apply rollback entries in reverse order. Stop package-manager activity first and inspect whether a configuration file has been edited since remediation before overwriting or deleting it. The manifest contains enough information to restore pre-run configuration and Windows environment state, but it cannot recover deleted dependency trees, caches, or payload artifacts.
+Apply rollback entries in reverse order. Inspect whether an IDE configuration file has been edited since remediation before overwriting or deleting it. The manifest contains enough information to restore pre-run configuration state, but it cannot recover deleted dependency trees or payload artifacts.
 
-Because `.npmrc` may contain registry credentials, never move the backup directory to a public share or attach it to an unrestricted ticket.
+IDE configuration backups may contain commands or environment details. Never move the backup directory to a public share or attach it to an unrestricted ticket.
 
 ## Exit codes
 
@@ -136,22 +143,25 @@ Configure the RMM job so `10` is collected as an attention state rather than tre
 
 | macOS/Linux | Windows | Purpose |
 | --- | --- | --- |
-| `--audit-only` | `-AuditOnly` | Report without cleanup or policy changes |
+| `--audit-only` | `-AuditOnly` | Report without endpoint cleanup or configuration changes |
 | `--ioc-file PATH` | `-IocFile PATH` | Use a pre-staged IOC CSV |
 | `--report-dir PATH` | `-ReportDirectory PATH` | Override report destination |
 | `--backup-dir PATH` | `-BackupDirectory PATH` | Override restricted backup parent |
 | `--scan-root PATH` | `-ScanRoot PATH` | Add explicit bounded roots; repeat/pass an array |
+| `--include-application-dirs` | `-IncludeApplicationDirectories` | Include normally pruned application and tool-state directories |
 | `--help` | `Get-Help .\scripts\Remediate-ShaiHulud.ps1 -Full` | Display help |
 
 ## Detection limitations
 
-Dependency declarations are reported rather than rewritten. The scanner checks direct declarations in `dependencies`, `devDependencies`, `optionalDependencies`, and `peerDependencies`; it does not prove whether a transitive or cached package was installed. Application owners must review lockfiles and perform their normal software-composition analysis before declaring an endpoint clean.
+Dependency declarations are reported rather than rewritten. The scanner checks direct declarations in `dependencies`, `devDependencies`, `optionalDependencies`, and `peerDependencies`, then checks matching packages installed directly beneath local or ancestor `node_modules`. It does not inspect lockfiles, prove whether a transitive or cached package was installed, evaluate every semver range, or inspect default-excluded application directories unless the explicit override is used. Application owners must review lockfiles and perform their normal software-composition analysis before declaring an endpoint clean.
+
+An installed version exactly present in the IOC list is marked `malicious`; unreadable or missing installed package metadata is marked `unknown`, and both cause the containing dependency tree to be targeted. A readable installed version absent from the IOC list is marked `not-listed` and retained. A declaration without a corresponding top-level installation is marked `not-installed`.
 
 The incident payload names `Math_Symbol.js`, `math_init.js`, and `bun-dl-*` are treated as deletion IOCs anywhere beneath the selected roots. `setup.mjs` is not deleted by name alone and must be referenced by a matched Claude Code hook or VS Code task. Review and tightly bound `--scan-root` / `-ScanRoot` during testing if legitimate content could use one of the incident-specific names.
 
 ## Local validation
 
-The bounded Unix integration test operates only in temporary fixture directories. It exercises remediation and audit modes, both JSON parsers, symlink safety, project-cache cleanup, IDE-persistence removal, persistence-only exit status, policy idempotency, non-object manifests, IOC reporting, and rollback manifests:
+The bounded Unix integration test operates only in temporary fixture directories. It exercises remediation and audit modes, both JSON parsers, targeted dependency-tree removal, retention of unrelated trees and caches, symlink safety, IDE-persistence removal, persistence-only exit status, non-object manifests, IOC reporting, and rollback manifests:
 
 ```bash
 ./tests/test-remediate.sh
@@ -169,11 +179,11 @@ Both tests are bounded to disposable temporary fixtures and validate the same pe
 
 Treat an endpoint as potentially compromised until the investigation is complete. After the script finishes:
 
-1. Reboot the machine. This stops surviving processes and ensures the lifecycle-script policy and environment changes are applied to new sessions.
-2. Preserve the JSON summary, logs, dependency report, persistence report, and backup manifest for the incident record. Record any exit code `10` or `20` for follow-up.
+1. Reboot the machine. This stops surviving processes and starts applications and developer tools in a clean session.
+2. Preserve the JSON summary, logs, dependency report, `node_modules` action report, persistence report, and backup manifest for the incident record. Record any exit code `10` or `20` for follow-up.
 3. From a trusted machine, rotate and revoke credentials that may have been available on the endpoint: npm and package-registry tokens, GitHub/GitLab tokens, cloud keys, CI/CD secrets, SSH keys, API keys, and active sessions. Review package-publish and repository activity for unauthorized changes.
-4. Review every dependency finding and update manifests and lockfiles to known-good versions. Reinstall dependencies from trusted lockfiles using the package manager's clean or frozen install mode while lifecycle scripts remain disabled. Do not re-enable lifecycle scripts until the application owner and incident team approve it.
+4. Review every dependency finding and update manifests and lockfiles to known-good versions. Reinstall removed dependencies from trusted lockfiles using the package manager's clean or frozen install mode. Consider disabling lifecycle scripts during reinstall until the application owner and incident team approve them.
 5. Inventory global npm modules with `npm root -g` and `npm ls -g --depth=0`. Remove and reinstall required global modules from trusted sources and pinned versions; do not assume global modules were safe merely because the script completed.
 6. Review installed IDE and developer-tool extensions, including VS Code, Claude Code, JetBrains, editor plugins, and globally installed developer CLIs. Remove suspicious extensions and reinstall required extensions from their official marketplaces or trusted packages. The persistence scan covers workspace hook/task files, not every installed extension.
 7. Recreate or reinstall build-agent and CI dependencies only after their credentials have been rotated. Review CI workspace hooks, package-manager configuration, and repository changes before allowing builds or publishing to resume.
-8. Run the script again in audit mode and confirm that the reports contain no unresolved persistence or dependency findings. Keep the generated configuration backups restricted; they may contain registry credentials.
+8. Run the script again in audit mode and confirm that the reports contain no unresolved persistence or dependency findings. Keep generated IDE configuration backups restricted.

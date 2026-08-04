@@ -159,7 +159,7 @@ default_report_dir() {
       printf '/var/log/Shai-Hulud-Remediation\n'
     fi
   elif [ -n "${HOME:-}" ] && [ -d "$HOME" ] && [ ! -L "$HOME" ]; then
-    printf '%s/.local/state/Shai-Hulud-Remediation/Reports\n' "$HOME"
+    printf '%s/.local/state/Shai-Hulud-Remediation\n' "$HOME"
   else
     mktemp -d "$SHAI_RUNTIME_TMP/shai-hulud-reports.XXXXXX"
   fi

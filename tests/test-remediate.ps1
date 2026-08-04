@@ -62,6 +62,11 @@ try {
 
     $firstSummaryPath = @(Get-ChildItem -LiteralPath $firstReports -Filter '*.json')[0].FullName
     $firstSummary = Get-Content -LiteralPath $firstSummaryPath -Raw | ConvertFrom-Json
+    $firstLogPath = @(Get-ChildItem -LiteralPath $firstReports -Filter '*.log')[0].FullName
+    $firstLogText = [IO.File]::ReadAllText($firstLogPath)
+    Assert-True ($firstSummary.operational_errors -eq 0) 'unexpected operational errors in first remediation'
+    Assert-True ($firstLogText -notmatch "Could not parse package manifest '.*Scanning filesystem") 'log output contaminated manifest scanning'
+    Assert-True ($firstLogText -notmatch "config ''") 'empty configuration path was processed'
     Assert-True ($firstSummary.node_modules_removed -eq 1) 'node_modules counter is incorrect'
     Assert-True ($firstSummary.caches_removed -eq 1) 'cache counter is incorrect'
     Assert-True ($firstSummary.configs_updated -eq 9) 'config counter is incorrect'

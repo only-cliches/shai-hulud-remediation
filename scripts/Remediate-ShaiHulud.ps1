@@ -106,7 +106,7 @@ if ($UsingDefaultReportDirectory) {
     # Keep reports in a predictable, operator-accessible Windows location for
     # both interactive and SYSTEM/RMM executions. Do not use C:\Users itself:
     # Set-PrivateDirectoryAcl must only apply to this dedicated subdirectory.
-    $ReportDirectory = 'C:\Users\Public\Shai-Hulud-Remediation\Reports'
+    $ReportDirectory = 'C:\Users\Public\Shai-Hulud-Remediation'
 }
 try {
     [void][IO.Directory]::CreateDirectory($ReportDirectory)
@@ -152,7 +152,10 @@ try {
 function Write-Log {
     param([string]$Level, [string]$Message)
     $line = '{0} [{1}] {2}' -f ([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')), $Level, $Message
-    Write-Output $line
+    # Write directly to the host instead of the success pipeline. Returning
+    # log lines from this function contaminates callers that collect objects,
+    # such as the manifest list returned by Get-TreeInventory.
+    try { [Console]::Out.WriteLine($line) } catch { Write-Host $line }
     try { [IO.File]::AppendAllText($script:ReportFile, $line + [Environment]::NewLine, (New-Object Text.UTF8Encoding($false))) } catch {}
 }
 
@@ -312,7 +315,7 @@ function Get-TreeInventory {
         while ($stack.Count -gt 0) {
             $current = $stack.Pop()
             $manifest = Join-Path $current 'package.json'
-            if ([IO.File]::Exists($manifest)) { $manifests.Add($manifest) }
+            if ([IO.File]::Exists($manifest)) { [void]$manifests.Add($manifest) }
             $currentLeaf = Split-Path -Leaf $current
             $ideConfig = $null
             if ($currentLeaf -ieq '.claude') { $ideConfig = Join-Path $current 'settings.json' }
@@ -451,6 +454,7 @@ function Backup-MachineEnvironmentVariable {
 
 function Write-AtomicTextFile {
     param([string]$Path, [string[]]$Lines)
+    if ([string]::IsNullOrWhiteSpace($Path)) { throw 'Cannot atomically write an empty path' }
     $parent = Split-Path -Parent $Path
     if (-not [string]::IsNullOrWhiteSpace($parent)) { [void][IO.Directory]::CreateDirectory($parent) }
     $temp = Join-Path $parent ('.shai-hulud-' + [Guid]::NewGuid().ToString('N') + '.tmp')
@@ -459,9 +463,10 @@ function Write-AtomicTextFile {
         if ([IO.File]::Exists($Path)) {
             try {
                 [IO.File]::Replace($temp, $Path, $null, $true)
-            } catch [System.PlatformNotSupportedException] {
-                Move-Item -LiteralPath $temp -Destination $Path -Force -ErrorAction Stop
-            } catch [System.IO.IOException] {
+            } catch [System.Exception] {
+                # Windows PowerShell/.NET can reject a null backup path or
+                # certain application-managed files. Fall back to same-volume
+                # replacement so a compatible host can still complete safely.
                 Move-Item -LiteralPath $temp -Destination $Path -Force -ErrorAction Stop
             }
         } else {
@@ -480,6 +485,7 @@ function Set-TextConfig {
         [string]$Replacement,
         [string]$Label
     )
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
     $lines = @()
     if ([IO.File]::Exists($Path)) {
         try { $lines = @([IO.File]::ReadAllLines($Path)) } catch { Add-OperationalError "Cannot read config '$Path': $($_.Exception.Message)"; return }
@@ -506,6 +512,7 @@ function Set-TextConfig {
 
 function Set-BunConfig {
     param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
     $lines = @()
     if ([IO.File]::Exists($Path)) {
         try { $lines = @([IO.File]::ReadAllLines($Path)) } catch { Add-OperationalError "Cannot read Bun config '$Path': $($_.Exception.Message)"; return }
@@ -552,6 +559,7 @@ function Set-BunConfig {
 
 function Protect-ConfigDirectory {
     param([string]$Directory, [ValidateSet('profile','project')][string]$Scope = 'profile')
+    if ([string]::IsNullOrWhiteSpace($Directory)) { return }
     Set-TextConfig (Join-Path $Directory '.npmrc') '^\s*ignore-scripts\s*=' '^\s*ignore-scripts\s*=\s*true\s*$' 'ignore-scripts=true' 'npm/pnpm lifecycle-script blocking'
     Set-TextConfig (Join-Path $Directory '.yarnrc') '^\s*--install\.ignore-scripts\s+' '^\s*--install\.ignore-scripts\s+true\s*$' '--install.ignore-scripts true' 'Yarn Classic lifecycle-script blocking'
     Set-TextConfig (Join-Path $Directory '.yarnrc.yml') '^enableScripts\s*:' '^enableScripts\s*:\s*false\s*$' 'enableScripts: false' 'Yarn lifecycle-script blocking'
@@ -595,7 +603,10 @@ function Protect-LifecycleScripts {
         Set-TextConfig (Join-Path $env:ProgramData 'npm\etc\npmrc') '^\s*ignore-scripts\s*=' '^\s*ignore-scripts\s*=\s*true\s*$' 'ignore-scripts=true' 'system npm lifecycle-script blocking'
         foreach ($profile in $Profiles) { Protect-ConfigDirectory $profile 'profile' }
     }
-    $projectDirectories = @($Manifests | ForEach-Object { Split-Path -Parent $_ } | Select-Object -Unique)
+    $projectDirectories = @($Manifests | Where-Object {
+        if ($_ -isnot [string] -or [string]::IsNullOrWhiteSpace($_)) { return $false }
+        try { return [IO.File]::Exists($_) -and ([IO.Path]::GetFileName($_) -ieq 'package.json') } catch { return $false }
+    } | ForEach-Object { Split-Path -Parent $_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
     foreach ($projectDirectory in $projectDirectories) { Protect-ConfigDirectory $projectDirectory 'project' }
 }
 
@@ -624,6 +635,7 @@ function Test-BunConfigCompliance {
 
 function Verify-ConfigDirectory {
     param([string]$Directory, [ValidateSet('profile','project')][string]$Scope = 'profile')
+    if ([string]::IsNullOrWhiteSpace($Directory)) { return }
     if (-not (Test-TextConfigCompliance (Join-Path $Directory '.npmrc') '^\s*ignore-scripts\s*=' '^\s*ignore-scripts\s*=\s*true\s*$')) { Add-OperationalError "npm/pnpm policy verification failed: $(Join-Path $Directory '.npmrc')" }
     if (-not (Test-TextConfigCompliance (Join-Path $Directory '.yarnrc') '^\s*--install\.ignore-scripts\s+' '^\s*--install\.ignore-scripts\s+true\s*$')) { Add-OperationalError "Yarn Classic policy verification failed: $(Join-Path $Directory '.yarnrc')" }
     if (-not (Test-TextConfigCompliance (Join-Path $Directory '.yarnrc.yml') '^enableScripts\s*:' '^enableScripts\s*:\s*false\s*$')) { Add-OperationalError "Yarn policy verification failed: $(Join-Path $Directory '.yarnrc.yml')" }
@@ -644,7 +656,10 @@ function Verify-PackageManagerControls {
         if (-not (Test-TextConfigCompliance $systemNpmrc '^\s*ignore-scripts\s*=' '^\s*ignore-scripts\s*=\s*true\s*$')) { Add-OperationalError "System npm policy verification failed: $systemNpmrc" }
         foreach ($profile in $Profiles) { Verify-ConfigDirectory $profile 'profile' }
     }
-    $projectDirectories = @($Manifests | ForEach-Object { Split-Path -Parent $_ } | Select-Object -Unique)
+    $projectDirectories = @($Manifests | Where-Object {
+        if ($_ -isnot [string] -or [string]::IsNullOrWhiteSpace($_)) { return $false }
+        try { return [IO.File]::Exists($_) -and ([IO.Path]::GetFileName($_) -ieq 'package.json') } catch { return $false }
+    } | ForEach-Object { Split-Path -Parent $_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
     foreach ($projectDirectory in $projectDirectories) { Verify-ConfigDirectory $projectDirectory 'project' }
 }
 
@@ -689,7 +704,7 @@ function Remove-IdePersistence {
         try {
             $item = Get-Item -LiteralPath $configPath -Force -ErrorAction Stop
             if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'not a regular, non-reparse-point file' }
-            $data = Get-Content -LiteralPath $configPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            $data = [IO.File]::ReadAllText($configPath) | ConvertFrom-Json -ErrorAction Stop
             if ($null -eq $data -or $data -is [Array] -or -not ($data -is [PSCustomObject])) { throw 'not a JSON object' }
         } catch {
             Add-PersistenceEvent $configPath 'error' '' $_.Exception.Message 'skipped'
@@ -820,10 +835,14 @@ function Find-VulnerableDeclarations {
     $iocMap = @{}
     foreach ($row in $IocRows) { $iocMap[[string]$row.Package] = [string]$row.'Malicious Versions' }
     $findings = New-Object 'System.Collections.Generic.List[object]'
-    foreach ($manifestPath in $Manifests) {
+    $validManifests = @($Manifests | Where-Object {
+        if ($_ -isnot [string] -or [string]::IsNullOrWhiteSpace($_)) { return $false }
+        try { return [IO.File]::Exists($_) -and ([IO.Path]::GetFileName($_) -ieq 'package.json') } catch { return $false }
+    })
+    foreach ($manifestPath in $validManifests) {
         $script:Stats.package_json_scanned++
         try {
-            $manifest = Get-Content -LiteralPath $manifestPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            $manifest = [IO.File]::ReadAllText($manifestPath) | ConvertFrom-Json -ErrorAction Stop
             if ($null -eq $manifest -or $manifest -is [Array] -or -not ($manifest -is [PSCustomObject])) { throw 'manifest is not a JSON object' }
         } catch {
             Add-OperationalError "Could not parse package manifest '$manifestPath': $($_.Exception.Message)"
@@ -862,11 +881,12 @@ function ConvertTo-CsvSafeValue {
 
 function Export-DependencyFindings {
     param([object[]]$Findings, [string]$Path)
-    if ($Findings.Count -eq 0) {
+    $validFindings = @($Findings | Where-Object { $null -ne $_ -and $null -ne $_.PSObject.Properties['Manifest'] })
+    if ($validFindings.Count -eq 0) {
         [IO.File]::WriteAllText($Path, '"Manifest","Section","Package","Declared","Malicious Versions","Match"' + [Environment]::NewLine, (New-Object Text.UTF8Encoding($false)))
         return
     }
-    $Findings | ForEach-Object {
+    $validFindings | ForEach-Object {
         [PSCustomObject][ordered]@{
             Manifest = ConvertTo-CsvSafeValue $_.Manifest
             Section = ConvertTo-CsvSafeValue $_.Section
@@ -880,11 +900,12 @@ function Export-DependencyFindings {
 
 function Export-PersistenceEvents {
     param([object[]]$Events, [string]$Path)
-    if ($Events.Count -eq 0) {
+    $validEvents = @($Events | Where-Object { $null -ne $_ -and $null -ne $_.PSObject.Properties['File'] })
+    if ($validEvents.Count -eq 0) {
         [IO.File]::WriteAllText($Path, '"File","Kind","Event","Command","Action"' + [Environment]::NewLine, (New-Object Text.UTF8Encoding($false)))
         return
     }
-    $Events | ForEach-Object {
+    $validEvents | ForEach-Object {
         [PSCustomObject][ordered]@{
             File = ConvertTo-CsvSafeValue $_.File
             Kind = ConvertTo-CsvSafeValue $_.Kind
@@ -922,7 +943,7 @@ try {
         Write-Log 'INFO' "Dependency report: $FindingsFile"
     } catch { Add-OperationalError "Could not publish dependency report: $($_.Exception.Message)" }
     try {
-        Export-PersistenceEvents @($PersistenceEvents) $PersistenceFile
+        Export-PersistenceEvents -Events @($PersistenceEvents.ToArray()) -Path $PersistenceFile
         Write-Log 'INFO' "Persistence report: $PersistenceFile"
     } catch { Add-OperationalError "Could not publish persistence report: $($_.Exception.Message)" }
 } catch {

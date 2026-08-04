@@ -93,9 +93,9 @@ Default report and backup locations are:
 
 | Platform | Elevated/default-scope reports | Non-elevated targeted reports | Restricted configuration backups |
 | --- | --- | --- | --- |
-| Linux | `/var/log/Shai-Hulud-Remediation` | `$HOME/.local/state/Shai-Hulud-Remediation/Reports` | `/var/lib/Shai-Hulud-Remediation/Backups/<run-id>` |
-| macOS | `/Library/Logs/Shai-Hulud-Remediation` | `$HOME/.local/state/Shai-Hulud-Remediation/Reports` | `/Library/Application Support/Shai-Hulud-Remediation/Backups/<run-id>` |
-| Windows | `C:\Users\Public\Shai-Hulud-Remediation\Reports` | `C:\Users\Public\Shai-Hulud-Remediation\Reports` | `%ProgramData%\Shai-Hulud-Remediation\Backups\<run-id>` |
+| Linux | `/var/log/Shai-Hulud-Remediation` | `$HOME/.local/state/Shai-Hulud-Remediation` | `/var/lib/Shai-Hulud-Remediation/Backups/<run-id>` |
+| macOS | `/Library/Logs/Shai-Hulud-Remediation` | `$HOME/.local/state/Shai-Hulud-Remediation` | `/Library/Application Support/Shai-Hulud-Remediation/Backups/<run-id>` |
+| Windows | `C:\Users\Public\Shai-Hulud-Remediation` | `C:\Users\Public\Shai-Hulud-Remediation` | `%ProgramData%\Shai-Hulud-Remediation\Backups\<run-id>` |
 
 If a non-elevated Unix run cannot use `$HOME`, it allocates a private temporary report directory and prints the path. Override locations with `--report-dir` / `-ReportDirectory` and `--backup-dir` / `-BackupDirectory`. Backup directories are created with restrictive permissions or ACLs even when their parent was supplied by the operator.
 

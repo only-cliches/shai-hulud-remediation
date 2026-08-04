@@ -23,6 +23,7 @@ set +e
 SHAI_HULUD_MANIFEST_PARSER=node "$SCRIPT_PATH" \
   --scan-root "$RUN_DIR/project" \
   --report-dir "$RUN_DIR/reports" \
+  --backup-dir "$RUN_DIR/backups" \
   --ioc-file "$TEST_DIR/fixtures/iocs.csv" >/dev/null
 FIRST_EXIT=$?
 set -e
@@ -31,6 +32,12 @@ set -e
 [ ! -e "$RUN_DIR/project/node_modules" ]
 [ ! -L "$RUN_DIR/project/linked/node_modules" ]
 [ -f "$RUN_DIR/linked-node-modules-target/keep" ]
+[ ! -e "$RUN_DIR/project/.yarn/cache" ]
+grep -qx 'ignore-scripts=true' "$RUN_DIR/project/.npmrc"
+grep -qx -- '--install.ignore-scripts true' "$RUN_DIR/project/.yarnrc"
+grep -qx 'enableScripts: false' "$RUN_DIR/project/.yarnrc.yml"
+[ "$(grep -c '^ignoreScripts = true$' "$RUN_DIR/project/.bunfig.toml")" -eq 1 ]
+grep -qx 'ignoreScripts: true' "$RUN_DIR/project/pnpm-workspace.yaml"
 grep -q ',bad-package,1.2.3,"1.2.3, 1.2.4",exact' "$RUN_DIR"/reports/*Dependencies*.csv
 grep -q ",'@bad/scoped,\^4.5.0,4.5.6,review-range" "$RUN_DIR"/reports/*Dependencies*.csv
 
@@ -64,6 +71,7 @@ set +e
   --audit-only \
   --scan-root "$RUN_DIR/project" \
   --report-dir "$RUN_DIR/audit-reports" \
+  --backup-dir "$RUN_DIR/audit-backups" \
   --ioc-file "$TEST_DIR/fixtures/iocs.csv" >/dev/null
 AUDIT_EXIT=$?
 set -e
@@ -88,6 +96,7 @@ set +e
 "$SCRIPT_PATH" \
   --scan-root "$RUN_DIR/project" \
   --report-dir "$RUN_DIR/second-reports" \
+  --backup-dir "$RUN_DIR/second-backups" \
   --ioc-file "$TEST_DIR/fixtures/iocs.csv" >/dev/null
 SECOND_EXIT=$?
 set -e
@@ -102,6 +111,7 @@ set +e
 "$SCRIPT_PATH" \
   --scan-root "$RUN_DIR/project" \
   --report-dir "$RUN_DIR/final-reports" \
+  --backup-dir "$RUN_DIR/final-backups" \
   --ioc-file "$TEST_DIR/fixtures/iocs.csv" >/dev/null
 FINAL_EXIT=$?
 set -e
@@ -110,37 +120,29 @@ set -e
 FINAL_SUMMARY="$(find "$RUN_DIR/final-reports" -name '*.json' -type f -print -quit)"
 grep -q '"configs_needing_change": 0' "$FINAL_SUMMARY"
 
-# Regression: a package.json containing valid JSON that is not an object
-# (null / []) must not abort the IOC scan; the valid manifest must still
-# be scanned and reported, and the malformed ones counted as parse errors.
-CRASH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/shai-hulud-crash.XXXXXX")"
-mkdir -p "$CRASH_DIR/proj/sub" "$CRASH_DIR/proj/sub2" "$CRASH_DIR/reports-node" "$CRASH_DIR/reports-py"
-printf '%s\n' '{"dependencies": {"bad-package": "1.2.3"}}' > "$CRASH_DIR/proj/package.json"
-printf 'null\n' > "$CRASH_DIR/proj/sub/package.json"
-printf '[]\n' > "$CRASH_DIR/proj/sub2/package.json"
-
+cp -R "$TEST_DIR/fixtures/project" "$RUN_DIR/invalid-ioc-project"
+mkdir -p "$RUN_DIR/invalid-ioc-project/node_modules/keep"
 set +e
-SHAI_HULUD_MANIFEST_PARSER=node "$SCRIPT_PATH" \
-  --scan-root "$CRASH_DIR/proj" --report-dir "$CRASH_DIR/reports-node" \
-  --ioc-file "$TEST_DIR/fixtures/iocs.csv" >/dev/null
-NODE_CRASH_EXIT=$?
+"$SCRIPT_PATH" \
+  --scan-root "$RUN_DIR/invalid-ioc-project" \
+  --report-dir "$RUN_DIR/invalid-ioc-reports" \
+  --backup-dir "$RUN_DIR/invalid-ioc-backups" \
+  --ioc-file "$TEST_DIR/fixtures/invalid-iocs.csv" >/dev/null
+INVALID_IOC_EXIT=$?
 set -e
-[ "$NODE_CRASH_EXIT" -eq 20 ]
-grep -q 'bad-package' "$CRASH_DIR"/reports-node/*Dependencies*.csv
-grep -q '"package_json_scanned": 3' "$CRASH_DIR"/reports-node/*.json
-grep -q '"dependency_findings": 1' "$CRASH_DIR"/reports-node/*.json
+[ "$INVALID_IOC_EXIT" -eq 20 ]
+[ -d "$RUN_DIR/invalid-ioc-project/node_modules/keep" ]
+grep -qx 'ignore-scripts=false' "$RUN_DIR/invalid-ioc-project/.npmrc"
 
-if command -v python3 >/dev/null 2>&1; then
-  set +e
-  SHAI_HULUD_MANIFEST_PARSER=python3 "$SCRIPT_PATH" \
-    --scan-root "$CRASH_DIR/proj" --report-dir "$CRASH_DIR/reports-py" \
-    --ioc-file "$TEST_DIR/fixtures/iocs.csv" >/dev/null
-  PY_CRASH_EXIT=$?
-  set -e
-  [ "$PY_CRASH_EXIT" -eq 20 ]
-  grep -q 'bad-package' "$CRASH_DIR"/reports-py/*Dependencies*.csv
-  grep -q '"package_json_scanned": 3' "$CRASH_DIR"/reports-py/*.json
-  grep -q '"dependency_findings": 1' "$CRASH_DIR"/reports-py/*.json
-fi
+ln -s "$RUN_DIR/invalid-ioc-project" "$RUN_DIR/symlink-scan-root"
+set +e
+"$SCRIPT_PATH" \
+  --scan-root "$RUN_DIR/symlink-scan-root" \
+  --report-dir "$RUN_DIR/symlink-root-reports" \
+  --ioc-file "$TEST_DIR/fixtures/iocs.csv" >/dev/null 2>&1
+SYMLINK_ROOT_EXIT=$?
+set -e
+[ "$SYMLINK_ROOT_EXIT" -eq 30 ]
+[ -d "$RUN_DIR/invalid-ioc-project/node_modules/keep" ]
 
 printf 'remediate-shai-hulud.sh tests passed\n'

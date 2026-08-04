@@ -2,112 +2,151 @@
 
 Unattended macOS, Linux, and Windows remediation for the npm supply-chain incident described by [Wiz](https://www.wiz.io/blog/keyv-and-cacheable-npm-supply-chain-attack) and [Aikido](https://www.aikido.dev/blog/keyv-and-friends-compromised-in-npm-supply-chain-attack).
 
-The scripts are intended for elevated deployment from NinjaOne, CrowdStrike Falcon, or a comparable RMM/EDR platform. They do not prompt. **Remediation is the default**, because an agent-run script cannot answer confirmation prompts.
+The scripts are designed for non-interactive execution from NinjaOne, CrowdStrike Falcon, or a comparable RMM/EDR platform. Remediation is the default; use audit mode when no endpoint changes are desired.
 
-## What it does
+> **Destructive operation:** remediation removes dependency trees and package caches and may modify package-manager files inside source repositories, leaving working trees dirty. Stop Node applications and pause build agents before deployment. Applications must reinstall their dependencies afterward. Deleted dependency trees and caches are not backed up.
 
-Each implementation performs the same workflow:
+## Remediation workflow
 
-1. Enumerates user profiles, home directories, common CI workspace locations (Jenkins, GitHub Actions, GitLab Runner, Buildkite), and any explicitly supplied scan roots, removing every `node_modules` directory found there without following symlinks/reparse points or crossing filesystem boundaries.
-2. Removes npm, pnpm, Yarn, Bun, Corepack, and node-gyp caches from every discovered user profile plus known system cache locations.
-3. Blocks package lifecycle scripts for npm/pnpm, Yarn Classic, modern Yarn, and Bun at machine and user-profile scope, backing up every modified policy file and recording the backups in a manifest.
-4. Hunts the worm's IDE persistence: surgically removes Claude Code hooks and VS Code `folderOpen` tasks whose commands reference the known payloads (`setup.mjs`, `Math_Symbol.js`, `math_init.js`, `bun-dl-*`), and deletes those payload files. Unrelated hooks, tasks, and settings are preserved; a `setup.mjs` referenced by a removed hook is deleted, while other files merely named `setup.mjs` are left untouched (the name alone is not a reliable IOC).
-5. Downloads the current [Wiz IOC package list](https://raw.githubusercontent.com/wiz-sec-public/wiz-research-iocs/refs/heads/main/reports/keyv-packages.csv), parses every remaining `package.json`, and reports matching dependency declarations. Exact malicious versions are labeled `exact`; ranges and aliases are conservatively labeled `review-range`.
-6. Writes a timestamped execution log, dependency CSV, persistence CSV, and machine-readable JSON summary to the desktop report directory and emits progress to stdout for the RMM job log.
+Both Windows & MacOS/Linux implementations perform the following workflow:
 
-The cleanup is idempotent. Re-running it removes anything recreated since the previous run and leaves compliant configuration unchanged.
+1. Obtain and validate the IOC CSV before making endpoint changes. If IOC acquisition fails, the run exits with an operational error without performing cleanup or changing package-manager policy.
+2. Scan discovered user profiles and common CI/build roots without following symlinks or Windows reparse points. macOS/Linux traversal stays on each selected filesystem; pass mounted workspaces as additional scan roots when needed.
+3. Remove every `node_modules`, project `.yarn/cache`, and project `.pnpm-store` beneath the selected roots. Full-scope runs also clear known npm, pnpm, Yarn, Bun, Corepack, and node-gyp user/system caches, including the historical `~/.pnpm-store` location.
+4. Disable third-party dependency lifecycle scripts at machine, profile, and discovered-project scope. Existing `pnpm-workspace.yaml` files receive `ignoreScripts: true`; project-local files are included because they can override profile policy.
+5. Verify the files and Windows machine environment values that were actually changed. Verification does not depend on the RMM account's current working directory or installed package-manager shims.
+6. Report IOC package declarations from `package.json` with vulnerable packages and write log, CSV, and JSON output suitable for RMM collection.
 
-> **Operational warning:** remediation deliberately deletes dependency trees and package caches across all local fixed disks. Applications must reinstall dependencies afterward. Lifecycle scripts remain disabled until an administrator intentionally reverses the policy.
+The lifecycle controls are intentionally persistent until an administrator rolls them back. Modern Yarn's `enableScripts: false` blocks third-party package postinstall scripts but does not suppress workspace postinstall scripts; use `yarn install --mode=skip-builds` when workspace scripts must also be skipped.
 
 ## Automated deployment
 
-Upload the appropriate script as an RMM/EDR component and run it as root on macOS/Linux or SYSTEM/Administrator on Windows. Do not use `curl | sh` for a security response workflow; pre-stage and integrity-check the file in your management platform.
+Pre-stage the appropriate script and, preferably, a reviewed IOC CSV in the management platform. Do not use `curl | sh` for an incident-response workflow.
 
-macOS/Linux:
-
-```bash
-/bin/bash ./scripts/remediate-shai-hulud.sh
-```
-
-Windows (64-bit Windows PowerShell 5.1 or PowerShell 7):
-
-```powershell
-powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\scripts\Remediate-ShaiHulud.ps1
-```
-
-Both commands remediate immediately and require no input. On Windows, launch the 64-bit PowerShell host so fixed-drive and profile discovery see the normal system registry view.
-
-For offline or egress-restricted endpoints, pre-stage the IOC CSV with the script:
+macOS/Linux, as root:
 
 ```bash
 /bin/bash ./scripts/remediate-shai-hulud.sh --ioc-file ./keyv-packages.csv
 ```
 
+Windows, as SYSTEM or Administrator using 64-bit Windows PowerShell 5.1 or PowerShell 7:
+
 ```powershell
-powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\scripts\Remediate-ShaiHulud.ps1 -IocFile .\keyv-packages.csv
+powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\scripts\Remediate-ShaiHulud.ps1 -IocFile .\keyv-packages.csv
 ```
 
-## Audit and targeted testing
+Omitting the IOC option downloads the current [Wiz IOC list](https://raw.githubusercontent.com/wiz-sec-public/wiz-research-iocs/refs/heads/main/reports/keyv-packages.csv) over HTTPS. Egress-restricted or tightly controlled environments should always use a pre-staged file.
 
-Audit-only mode is non-mutating:
+Recommended rollout:
+
+1. Run audit mode against a representative endpoint.
+2. Run targeted remediation against a disposable fixture or test workspace.
+3. Pause build agents and applications that use Node dependencies.
+4. Deploy full remediation and collect the JSON summary plus logs.
+5. Review IOC declarations, update affected manifests and lockfiles, then reinstall dependencies while lifecycle scripts remain disabled.
+
+## Scope and targeted testing
+
+Default scope includes:
+
+- macOS/Linux user homes, including non-standard Linux homes from `/etc/passwd`;
+- common Jenkins, GitHub Actions, GitLab Runner, Buildkite, generic build, workspace, and CI roots;
+- corresponding named CI roots on every Windows fixed drive; and
+- Windows profiles discovered from the registry and `Users` directory.
+
+The default deliberately does not sweep every directory on every fixed disk, which avoids deleting dependencies embedded in unrelated installed applications. Add each additional application or mounted workspace explicitly with a repeatable `--scan-root` or a PowerShell array passed to `-ScanRoot`.
+
+Targeted runs do not require elevation. They remove dependency trees/project caches and update package-manager configuration only beside `package.json` files beneath the supplied roots. They do not clear profile/system caches or change machine-wide policy.
 
 ```bash
-/bin/bash ./scripts/remediate-shai-hulud.sh --audit-only
+/bin/bash ./scripts/remediate-shai-hulud.sh \
+  --scan-root /tmp/remediation-fixture \
+  --report-dir /tmp/remediation-report \
+  --backup-dir /tmp/remediation-backups \
+  --ioc-file ./keyv-packages.csv
 ```
 
 ```powershell
-powershell.exe -NoProfile -NonInteractive -File .\scripts\Remediate-ShaiHulud.ps1 -AuditOnly
+.\scripts\Remediate-ShaiHulud.ps1 `
+  -ScanRoot C:\remediation-fixture `
+  -ReportDirectory C:\remediation-report `
+  -BackupDirectory C:\remediation-backups `
+  -IocFile .\keyv-packages.csv
 ```
 
-`--scan-root PATH` / `-ScanRoot PATH` restricts traversal, cache cleanup, and configuration changes to discovered projects beneath one or more test roots. This is useful for validation before fleet rollout and does not require elevation:
+Audit mode inventories the same scope but does not delete caches/dependencies or change policy. It still writes reports, which is the only intentional endpoint mutation:
 
 ```bash
-/bin/bash ./scripts/remediate-shai-hulud.sh --scan-root /tmp/remediation-fixture --report-dir /tmp/remediation-report --ioc-file ./keyv-packages.csv
+/bin/bash ./scripts/remediate-shai-hulud.sh --audit-only --ioc-file ./keyv-packages.csv
 ```
 
 ```powershell
-.\scripts\Remediate-ShaiHulud.ps1 -ScanRoot C:\remediation-fixture -ReportDirectory C:\remediation-report -IocFile .\keyv-packages.csv
+powershell.exe -NoProfile -NonInteractive -File .\scripts\Remediate-ShaiHulud.ps1 -AuditOnly -IocFile .\keyv-packages.csv
 ```
 
-## Reports and exit codes
+## Reports, backups, and rollback
 
-The default report location is the active user's Desktop on macOS, the agent account's Desktop on Linux, and the Public Desktop on Windows. If that location is unavailable, the scripts use an OS-appropriate shared temporary/program-data directory. Override it with `--report-dir` or `-ReportDirectory`.
+Elevated default locations are private machine state rather than a user's or Public Desktop:
 
-Each run creates:
+| Platform | Reports | Restricted configuration backups |
+| --- | --- | --- |
+| Linux | `/var/log/Shai-Hulud-Remediation` | `/var/lib/Shai-Hulud-Remediation/Backups/<run-id>` |
+| macOS | `/Library/Logs/Shai-Hulud-Remediation` | `/Library/Application Support/Shai-Hulud-Remediation/Backups/<run-id>` |
+| Windows | `%ProgramData%\Shai-Hulud-Remediation\Reports` | `%ProgramData%\Shai-Hulud-Remediation\Backups\<run-id>` |
 
-- `Shai-Hulud-Remediation-<run-id>.log` — full activity and errors
-- `Shai-Hulud-Dependencies-<run-id>.csv` — matched dependency declarations
-- `Shai-Hulud-Persistence-<run-id>.csv` — removed (or would-remove) IDE hooks and worm payload files
-- `Shai-Hulud-Config-Backups-<run-id>/` — pre-modification copies of every policy file the run rewrote, with `manifest.tsv`
-- `Shai-Hulud-Remediation-<run-id>.json` — stable summary fields for RMM custom-field ingestion
+Non-elevated targeted Windows runs use `%LOCALAPPDATA%`; non-elevated Unix runs use `$HOME/.local/state` when available and otherwise allocate a private temporary directory. Override locations with `--report-dir` / `-ReportDirectory` and `--backup-dir` / `-BackupDirectory`. Backup directories are created with restrictive permissions or ACLs even when their parent was supplied by the operator.
 
-To make the CSV safe to open in spreadsheet software, any report cell beginning with whitespace and a formula trigger (`=`, `+`, `-`, or `@`) is prefixed with an apostrophe. This affects display only; the JSON summary remains intended for automated ingestion.
+Each run writes:
 
-Exit codes are designed for automation:
+- `Shai-Hulud-Remediation-<run-id>.log` — activity, warnings, and errors;
+- `Shai-Hulud-Dependencies-<run-id>.csv` — matching dependency declarations; and
+- `Shai-Hulud-Remediation-<run-id>.json` — stable fields for RMM ingestion.
+
+Remediation runs also create `manifest.tsv` in the restricted backup directory. Backups use short sequence names, avoiding path collisions and component-length failures. Manifest actions are:
+
+| Action | Rollback meaning |
+| --- | --- |
+| `RESTORE_FILE` | Replace `Target` with the file in `BackupOrValue` |
+| `DELETE_FILE` | `Target` did not exist before the run; remove it during rollback |
+| `RESTORE_ENV` | Restore the Windows machine variable to the Base64-encoded UTF-8 value |
+| `DELETE_ENV` | The Windows machine variable did not exist; remove it during rollback |
+
+Apply rollback entries in reverse order. Stop package-manager activity first and inspect whether a configuration file has been edited since remediation before overwriting or deleting it. The manifest contains enough information to restore pre-run configuration and Windows environment state, but it cannot recover deleted dependency trees or caches.
+
+Because `.npmrc` may contain registry credentials, never move the backup directory to a public share or attach it to an unrestricted ticket.
+
+## Exit codes
 
 | Code | Meaning |
 | ---: | --- |
 | `0` | Completed without IOC declarations or operational errors |
-| `10` | Attention required: IOC declarations found, worm IDE persistence found, or audit found cleanup work |
-| `20` | Completed with one or more operational errors; inspect the log |
-| `30` | Invocation error, unsupported OS, or full-disk run was not elevated |
+| `10` | Attention required: IOC declarations found, or audit found remediation work |
+| `20` | One or more operational errors occurred; inspect the log |
+| `30` | Invalid invocation, unsupported OS, initialization failure, or insufficient privileges |
 
-Dependency declarations are reported rather than rewritten. Package version changes require application-owner review; after updating manifests/lockfiles to known-good releases, reinstall with lifecycle scripts still disabled and only re-enable scripts after the incident-response team approves it.
+Configure the RMM job so `10` is collected as an attention state rather than treated as an execution failure. The stdout `SUMMARY` line mirrors the final status even if the JSON summary itself cannot be written.
 
 ## Options
 
 | macOS/Linux | Windows | Purpose |
 | --- | --- | --- |
-| `--audit-only` | `-AuditOnly` | Scan without modifying the endpoint |
+| `--audit-only` | `-AuditOnly` | Report without cleanup or policy changes |
 | `--ioc-file PATH` | `-IocFile PATH` | Use a pre-staged IOC CSV |
 | `--report-dir PATH` | `-ReportDirectory PATH` | Override report destination |
-| `--scan-root PATH` | `-ScanRoot PATH` | Restrict scope; repeat/pass an array for multiple roots |
-| `--help` | `Get-Help .\scripts\Remediate-ShaiHulud.ps1 -Full` | Display usage/help |
+| `--backup-dir PATH` | `-BackupDirectory PATH` | Override restricted backup parent |
+| `--scan-root PATH` | `-ScanRoot PATH` | Add explicit bounded roots; repeat/pass an array |
+| `--help` | `Get-Help .\scripts\Remediate-ShaiHulud.ps1 -Full` | Display help |
+
+## Detection limitations
+
+Dependency declarations are reported rather than rewritten. The scanner checks direct declarations in `dependencies`, `devDependencies`, `optionalDependencies`, and `peerDependencies`; it does not prove whether a transitive or cached package was installed. Application owners must review lockfiles and perform their normal software-composition analysis before declaring an endpoint clean.
 
 ## Local validation
 
-The bounded integration test creates an isolated temporary project, exercises remediation and audit modes through both Unix JSON-parser paths, verifies IDE-persistence removal (and audit preservation), covers the non-object-manifest scanner regression, checks idempotency, validates all report formats, and removes its temporary data:
+The bounded Unix integration test operates only in temporary fixture directories. It exercises remediation and audit modes, both JSON parsers, symlink safety, project-cache cleanup, policy idempotency, IOC reporting, and rollback manifests:
 
 ```bash
 ./tests/test-remediate.sh
 ```
+
+Run the PowerShell script's targeted mode on a disposable Windows fixture before fleet rollout; the Unix test does not execute the Windows implementation.

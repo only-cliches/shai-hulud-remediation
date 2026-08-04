@@ -12,12 +12,13 @@ param(
     [switch]$AuditOnly,
     [string]$IocFile,
     [string]$ReportDirectory,
+    [string]$BackupDirectory,
     [string[]]$ScanRoot
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Continue'
-$ToolVersion = '2.0.0'
+$ToolVersion = '2.1.0'
 $IocUrl = 'https://raw.githubusercontent.com/wiz-sec-public/wiz-research-iocs/refs/heads/main/reports/keyv-packages.csv'
 $Mode = if ($AuditOnly) { 'audit' } else { 'remediate' }
 $CustomScope = $null -ne $ScanRoot -and $ScanRoot.Count -gt 0
@@ -39,8 +40,17 @@ function Test-IsAdministrator {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-if (-not $CustomScope -and -not (Test-IsAdministrator)) {
-    Write-Error 'Full-disk operation requires Administrator or SYSTEM.'
+function Test-IsSafeDirectoryPath {
+    param([string]$Path)
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        return $item.PSIsContainer -and (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)
+    } catch { return $false }
+}
+
+$IsAdministrator = Test-IsAdministrator
+if (-not $CustomScope -and -not $IsAdministrator) {
+    Write-Error 'Default-scope remediation requires Administrator or SYSTEM.'
     exit 30
 }
 if ($CustomScope) {
@@ -49,7 +59,7 @@ if ($CustomScope) {
         try {
             if (-not [IO.Path]::IsPathRooted($root)) { throw 'Path must be absolute' }
             $fullRoot = [IO.Path]::GetFullPath($root)
-            if (-not [IO.Directory]::Exists($fullRoot)) { throw 'Directory does not exist' }
+            if (-not (Test-IsSafeDirectoryPath $fullRoot)) { throw 'Directory does not exist or is a reparse point' }
             $validatedRoots.Add($fullRoot)
         } catch {
             Write-Error "Invalid -ScanRoot '$root': $($_.Exception.Message)"
@@ -58,15 +68,43 @@ if ($CustomScope) {
     }
     $ScanRoot = @($validatedRoots)
 }
+if (-not [string]::IsNullOrWhiteSpace($BackupDirectory) -and -not [IO.Path]::IsPathRooted($BackupDirectory)) {
+    Write-Error '-BackupDirectory must be an absolute path.'
+    exit 30
+}
 
-if ([string]::IsNullOrWhiteSpace($ReportDirectory)) {
-    $ReportDirectory = [Environment]::GetFolderPath('CommonDesktopDirectory')
-    if ([string]::IsNullOrWhiteSpace($ReportDirectory)) {
-        $ReportDirectory = Join-Path $env:ProgramData 'Shai-Hulud-Remediation'
+function Set-PrivateDirectoryAcl {
+    param([string]$Path, [bool]$AdministratorScope)
+    try {
+        $security = New-Object Security.AccessControl.DirectorySecurity
+        $security.SetAccessRuleProtection($true, $false)
+        $inheritance = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+        $propagation = [Security.AccessControl.PropagationFlags]::None
+        $allow = [Security.AccessControl.AccessControlType]::Allow
+        $identities = if ($AdministratorScope) {
+            @((New-Object Security.Principal.SecurityIdentifier -ArgumentList 'S-1-5-18'), (New-Object Security.Principal.SecurityIdentifier -ArgumentList 'S-1-5-32-544'))
+        } else {
+            @([Security.Principal.WindowsIdentity]::GetCurrent().User)
+        }
+        foreach ($identity in $identities) {
+            $rule = New-Object Security.AccessControl.FileSystemAccessRule($identity, [Security.AccessControl.FileSystemRights]::FullControl, $inheritance, $propagation, $allow)
+            [void]$security.AddAccessRule($rule)
+        }
+        Set-Acl -LiteralPath $Path -AclObject $security -ErrorAction Stop
+    } catch {
+        throw "Could not restrict directory '$Path': $($_.Exception.Message)"
     }
+}
+
+$UsingDefaultReportDirectory = [string]::IsNullOrWhiteSpace($ReportDirectory)
+if ($UsingDefaultReportDirectory) {
+    $stateRoot = if ($IsAdministrator) { $env:ProgramData } elseif (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) { $env:LOCALAPPDATA } else { [IO.Path]::GetTempPath() }
+    $ReportDirectory = Join-Path $stateRoot 'Shai-Hulud-Remediation\Reports'
 }
 try {
     [void][IO.Directory]::CreateDirectory($ReportDirectory)
+    if (-not (Test-IsSafeDirectoryPath $ReportDirectory)) { throw 'Report directory is a reparse point' }
+    if ($UsingDefaultReportDirectory) { Set-PrivateDirectoryAcl $ReportDirectory $IsAdministrator }
 } catch {
     Write-Error "Cannot create report directory '$ReportDirectory': $($_.Exception.Message)"
     exit 30
@@ -76,13 +114,25 @@ $RunId = '{0}-{1}' -f ([DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ')), $PID
 $ReportFile = Join-Path $ReportDirectory "Shai-Hulud-Remediation-$RunId.log"
 $SummaryFile = Join-Path $ReportDirectory "Shai-Hulud-Remediation-$RunId.json"
 $FindingsFile = Join-Path $ReportDirectory "Shai-Hulud-Dependencies-$RunId.csv"
-$ConfigBackupDirectory = Join-Path $ReportDirectory "Shai-Hulud-Config-Backups-$RunId"
+$UsingDefaultBackupDirectory = [string]::IsNullOrWhiteSpace($BackupDirectory)
+if ($UsingDefaultBackupDirectory) {
+    $backupStateRoot = if ($IsAdministrator) { $env:ProgramData } elseif (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) { $env:LOCALAPPDATA } else { [IO.Path]::GetTempPath() }
+    $BackupDirectory = Join-Path $backupStateRoot 'Shai-Hulud-Remediation\Backups'
+}
+$ConfigBackupDirectory = Join-Path $BackupDirectory $RunId
 $ConfigBackupManifest = Join-Path $ConfigBackupDirectory "manifest.tsv"
+$ConfigBackupSequence = 0
 $WorkingDirectory = Join-Path ([IO.Path]::GetTempPath()) "shai-hulud-$([Guid]::NewGuid().ToString('N'))"
 try {
     [void][IO.Directory]::CreateDirectory($WorkingDirectory)
-    [void][IO.Directory]::CreateDirectory($ConfigBackupDirectory)
-    [IO.File]::WriteAllText($ConfigBackupManifest, '', (New-Object Text.UTF8Encoding($false)))
+    if ($Mode -eq 'remediate') {
+        [void][IO.Directory]::CreateDirectory($BackupDirectory)
+        if (-not (Test-IsSafeDirectoryPath $BackupDirectory)) { throw 'Backup directory is a reparse point' }
+        if ([IO.Directory]::Exists($ConfigBackupDirectory) -or [IO.File]::Exists($ConfigBackupDirectory)) { throw "Config backup run directory already exists: $ConfigBackupDirectory" }
+        [void][IO.Directory]::CreateDirectory($ConfigBackupDirectory)
+        Set-PrivateDirectoryAcl $ConfigBackupDirectory $IsAdministrator
+        [IO.File]::WriteAllText($ConfigBackupManifest, "Action`tTarget`tBackupOrValue" + [Environment]::NewLine, (New-Object Text.UTF8Encoding($false)))
+    }
     [IO.File]::WriteAllText($ReportFile, '', (New-Object Text.UTF8Encoding($false)))
 } catch {
     Write-Error "Cannot initialize remediation files: $($_.Exception.Message)"
@@ -148,17 +198,23 @@ function Get-LocalScanRoots {
 
     $roots = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     foreach ($profile in $Profiles) {
-        if ([IO.Directory]::Exists($profile)) { [void]$roots.Add([IO.Path]::GetFullPath($profile)) }
+        if (Test-IsSafeDirectoryPath $profile) { [void]$roots.Add([IO.Path]::GetFullPath($profile)) }
     }
-    foreach ($candidate in @(
-        "$env:SystemDrive\Builds",
-        "$env:SystemDrive\agent\_work",
-        "$env:SystemDrive\actions-runner\_work",
-        "$env:SystemDrive\gitlab-runner\builds",
-        "$env:ProgramData\Jenkins",
-        "$env:ProgramData\Buildkite-Agent\builds"
-    )) {
-        if ([IO.Directory]::Exists($candidate)) { [void]$roots.Add([IO.Path]::GetFullPath($candidate)) }
+    $fixedDrives = @()
+    try {
+        $fixedDrives = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction Stop | ForEach-Object { [string]$_.DeviceID })
+    } catch {
+        Write-Log 'WARN' "Could not enumerate fixed drives for CI root discovery: $($_.Exception.Message)"
+        $fixedDrives = @($env:SystemDrive)
+    }
+    foreach ($drive in $fixedDrives) {
+        foreach ($relative in @('Builds', 'agent\_work', 'actions-runner\_work', 'gitlab-runner\builds', 'workspace', 'workspaces')) {
+            $candidate = Join-Path "$drive\" $relative
+            if (Test-IsSafeDirectoryPath $candidate) { [void]$roots.Add([IO.Path]::GetFullPath($candidate)) }
+        }
+    }
+    foreach ($candidate in @((Join-Path $env:ProgramData 'Jenkins'), (Join-Path $env:ProgramData 'Buildkite-Agent\builds'))) {
+        if (Test-IsSafeDirectoryPath $candidate) { [void]$roots.Add([IO.Path]::GetFullPath($candidate)) }
     }
     return $roots
 }
@@ -169,14 +225,14 @@ function Get-UserProfiles {
     try {
         Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\*' -ErrorAction Stop | ForEach-Object {
             $path = [Environment]::ExpandEnvironmentVariables([string]$_.ProfileImagePath)
-            if ([IO.Directory]::Exists($path)) { [void]$profiles.Add([IO.Path]::GetFullPath($path)) }
+            if (Test-IsSafeDirectoryPath $path) { [void]$profiles.Add([IO.Path]::GetFullPath($path)) }
         }
     } catch {
         Add-OperationalError "Could not enumerate profile registry entries: $($_.Exception.Message)"
     }
     if ([IO.Directory]::Exists("$env:SystemDrive\Users")) {
         try {
-            [IO.Directory]::EnumerateDirectories("$env:SystemDrive\Users") | ForEach-Object { [void]$profiles.Add($_) }
+            [IO.Directory]::EnumerateDirectories("$env:SystemDrive\Users") | Where-Object { Test-IsSafeDirectoryPath $_ } | ForEach-Object { [void]$profiles.Add($_) }
         } catch { Add-OperationalError "Could not enumerate user profiles: $($_.Exception.Message)" }
     }
     return $profiles
@@ -186,6 +242,7 @@ function Get-TreeInventory {
     param([string[]]$Roots)
     $manifests = New-Object 'System.Collections.Generic.List[string]'
     foreach ($root in $Roots) {
+        if (-not (Test-IsSafeDirectoryPath $root)) { Add-OperationalError "Refusing to scan missing or reparse-point root '$root'"; continue }
         Write-Log 'INFO' "Scanning filesystem: $root"
         $stack = New-Object 'System.Collections.Generic.Stack[string]'
         $stack.Push($root)
@@ -198,6 +255,11 @@ function Get-TreeInventory {
                     $directory = New-Object IO.DirectoryInfo($directoryPath)
                     if ($directory.Name -ieq 'node_modules') {
                         Remove-RemediationDirectory $directory.FullName 'node_modules'
+                        continue
+                    }
+                    if ($directory.Name -ieq '.pnpm-store' -or
+                        ($directory.Name -ieq 'cache' -and $directory.Parent.Name -ieq '.yarn')) {
+                        Remove-RemediationDirectory $directory.FullName 'project package cache'
                         continue
                     }
                     if (($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
@@ -222,6 +284,7 @@ function Remove-KnownCaches {
         $paths = @(
             (Join-Path $profile '.npm'),
             (Join-Path $profile '.npm-cache'),
+            (Join-Path $profile '.pnpm-store'),
             (Join-Path $profile '.cache\pnpm'),
             (Join-Path $profile '.cache\yarn'),
             (Join-Path $profile '.cache\node\corepack'),
@@ -244,21 +307,61 @@ function Remove-KnownCaches {
 
 function Backup-ConfigFile {
     param([string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) { return $true }
+    $item = $null
     try {
         $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    } catch [System.Management.Automation.ItemNotFoundException] {
+        try {
+            [IO.File]::AppendAllText($script:ConfigBackupManifest, "DELETE_FILE`t$Path`t-" + [Environment]::NewLine, (New-Object Text.UTF8Encoding($false)))
+            return $true
+        } catch {
+            Add-OperationalError "Could not record rollback action for new config '$Path': $($_.Exception.Message)"
+            return $false
+        }
+    } catch {
+        Add-OperationalError "Could not inspect config '$Path' before backup: $($_.Exception.Message)"
+        return $false
+    }
+    try {
         if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
             Add-OperationalError "Refusing to modify reparse-point config '$Path'"
             return $false
         }
-        $safeName = ($Path -replace '[:\\/]', '_')
-        $backup = Join-Path $script:ConfigBackupDirectory $safeName
-        Copy-Item -LiteralPath $Path -Destination $backup -Force -ErrorAction Stop
-        [IO.File]::AppendAllText($script:ConfigBackupManifest, "$Path`t$backup" + [Environment]::NewLine, (New-Object Text.UTF8Encoding($false)))
+        if ($item.PSIsContainer) {
+            Add-OperationalError "Refusing to replace directory with config file '$Path'"
+            return $false
+        }
+        $script:ConfigBackupSequence++
+        $backup = Join-Path $script:ConfigBackupDirectory ('{0:D6}.bak' -f $script:ConfigBackupSequence)
+        Copy-Item -LiteralPath $Path -Destination $backup -ErrorAction Stop
+        try {
+            [IO.File]::AppendAllText($script:ConfigBackupManifest, "RESTORE_FILE`t$Path`t$backup" + [Environment]::NewLine, (New-Object Text.UTF8Encoding($false)))
+        } catch {
+            Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+            throw
+        }
         Write-Log 'INFO' "Backed up config: $Path -> $backup"
         return $true
     } catch {
         Add-OperationalError "Could not back up config '$Path': $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Backup-MachineEnvironmentVariable {
+    param([string]$Name)
+    try {
+        $current = [Environment]::GetEnvironmentVariable($Name, 'Machine')
+        if ($null -eq $current) {
+            $entry = "DELETE_ENV`t$Name`t-"
+        } else {
+            $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($current))
+            $entry = "RESTORE_ENV`t$Name`t$encoded"
+        }
+        [IO.File]::AppendAllText($script:ConfigBackupManifest, $entry + [Environment]::NewLine, (New-Object Text.UTF8Encoding($false)))
+        return $true
+    } catch {
+        Add-OperationalError "Could not record previous machine environment value '$Name': $($_.Exception.Message)"
         return $false
     }
 }
@@ -271,7 +374,13 @@ function Write-AtomicTextFile {
     try {
         [IO.File]::WriteAllLines($temp, $Lines, (New-Object Text.UTF8Encoding($false)))
         if ([IO.File]::Exists($Path)) {
-            [IO.File]::Replace($temp, $Path, $null, $true)
+            try {
+                [IO.File]::Replace($temp, $Path, $null, $true)
+            } catch [System.PlatformNotSupportedException] {
+                Move-Item -LiteralPath $temp -Destination $Path -Force -ErrorAction Stop
+            } catch [System.IO.IOException] {
+                Move-Item -LiteralPath $temp -Destination $Path -Force -ErrorAction Stop
+            }
         } else {
             [IO.File]::Move($temp, $Path)
         }
@@ -359,58 +468,101 @@ function Set-BunConfig {
 }
 
 function Protect-ConfigDirectory {
-    param([string]$Directory)
+    param([string]$Directory, [ValidateSet('profile','project')][string]$Scope = 'profile')
     Set-TextConfig (Join-Path $Directory '.npmrc') '^\s*ignore-scripts\s*=' '^\s*ignore-scripts\s*=\s*true\s*$' 'ignore-scripts=true' 'npm/pnpm lifecycle-script blocking'
     Set-TextConfig (Join-Path $Directory '.yarnrc') '^\s*--install\.ignore-scripts\s+' '^\s*--install\.ignore-scripts\s+true\s*$' '--install.ignore-scripts true' 'Yarn Classic lifecycle-script blocking'
-    Set-TextConfig (Join-Path $Directory '.yarnrc.yml') '^\s*enableScripts\s*:' '^\s*enableScripts\s*:\s*false\s*$' 'enableScripts: false' 'Yarn lifecycle-script blocking'
+    Set-TextConfig (Join-Path $Directory '.yarnrc.yml') '^enableScripts\s*:' '^enableScripts\s*:\s*false\s*$' 'enableScripts: false' 'Yarn lifecycle-script blocking'
     Set-BunConfig (Join-Path $Directory '.bunfig.toml')
+    $pnpmWorkspace = Join-Path $Directory 'pnpm-workspace.yaml'
+    if ($Scope -eq 'project' -and [IO.File]::Exists($pnpmWorkspace)) {
+        Set-TextConfig $pnpmWorkspace '^ignoreScripts\s*:' '^ignoreScripts\s*:\s*true\s*$' 'ignoreScripts: true' 'pnpm lifecycle-script blocking'
+    }
 }
 
 function Protect-LifecycleScripts {
-    param($Profiles)
-    if ($script:CustomScope) {
-        Write-Log 'INFO' 'Custom scan scope selected; package-manager policy files were not changed'
-        return
-    }
-    if ($script:Mode -eq 'audit') {
-        if ([Environment]::GetEnvironmentVariable('NPM_CONFIG_IGNORE_SCRIPTS', 'Machine') -ne 'true') { $script:Stats.configs_needing_change++; Write-Log 'AUDIT' 'Would set machine NPM_CONFIG_IGNORE_SCRIPTS=true' }
-        if ([Environment]::GetEnvironmentVariable('YARN_ENABLE_SCRIPTS', 'Machine') -ne 'false') { $script:Stats.configs_needing_change++; Write-Log 'AUDIT' 'Would set machine YARN_ENABLE_SCRIPTS=false' }
-    } else {
-        if ([Environment]::GetEnvironmentVariable('NPM_CONFIG_IGNORE_SCRIPTS', 'Machine') -ne 'true') {
-            $script:Stats.configs_needing_change++
-            try { [Environment]::SetEnvironmentVariable('NPM_CONFIG_IGNORE_SCRIPTS', 'true', 'Machine'); $script:Stats.configs_updated++; Write-Log 'INFO' 'Set machine NPM_CONFIG_IGNORE_SCRIPTS=true' } catch { Add-OperationalError "Could not set machine npm policy: $($_.Exception.Message)" }
+    param($Profiles, [string[]]$Manifests)
+    if (-not $script:CustomScope) {
+        if ($script:Mode -eq 'audit') {
+            if ([Environment]::GetEnvironmentVariable('NPM_CONFIG_IGNORE_SCRIPTS', 'Machine') -ne 'true') { $script:Stats.configs_needing_change++; Write-Log 'AUDIT' 'Would set machine NPM_CONFIG_IGNORE_SCRIPTS=true' }
+            if ([Environment]::GetEnvironmentVariable('YARN_ENABLE_SCRIPTS', 'Machine') -ne 'false') { $script:Stats.configs_needing_change++; Write-Log 'AUDIT' 'Would set machine YARN_ENABLE_SCRIPTS=false' }
+        } else {
+            if ([Environment]::GetEnvironmentVariable('NPM_CONFIG_IGNORE_SCRIPTS', 'Machine') -ne 'true') {
+                $script:Stats.configs_needing_change++
+                if (Backup-MachineEnvironmentVariable 'NPM_CONFIG_IGNORE_SCRIPTS') {
+                    try {
+                        [Environment]::SetEnvironmentVariable('NPM_CONFIG_IGNORE_SCRIPTS', 'true', 'Machine')
+                        [Environment]::SetEnvironmentVariable('NPM_CONFIG_IGNORE_SCRIPTS', 'true', 'Process')
+                        $script:Stats.configs_updated++
+                        Write-Log 'INFO' 'Set machine NPM_CONFIG_IGNORE_SCRIPTS=true'
+                    } catch { Add-OperationalError "Could not set machine npm policy: $($_.Exception.Message)" }
+                }
+            }
+            if ([Environment]::GetEnvironmentVariable('YARN_ENABLE_SCRIPTS', 'Machine') -ne 'false') {
+                $script:Stats.configs_needing_change++
+                if (Backup-MachineEnvironmentVariable 'YARN_ENABLE_SCRIPTS') {
+                    try {
+                        [Environment]::SetEnvironmentVariable('YARN_ENABLE_SCRIPTS', 'false', 'Machine')
+                        [Environment]::SetEnvironmentVariable('YARN_ENABLE_SCRIPTS', 'false', 'Process')
+                        $script:Stats.configs_updated++
+                        Write-Log 'INFO' 'Set machine YARN_ENABLE_SCRIPTS=false'
+                    } catch { Add-OperationalError "Could not set machine Yarn policy: $($_.Exception.Message)" }
+                }
+            }
         }
-        if ([Environment]::GetEnvironmentVariable('YARN_ENABLE_SCRIPTS', 'Machine') -ne 'false') {
-            $script:Stats.configs_needing_change++
-            try { [Environment]::SetEnvironmentVariable('YARN_ENABLE_SCRIPTS', 'false', 'Machine'); $script:Stats.configs_updated++; Write-Log 'INFO' 'Set machine YARN_ENABLE_SCRIPTS=false' } catch { Add-OperationalError "Could not set machine Yarn policy: $($_.Exception.Message)" }
-        }
+        Set-TextConfig (Join-Path $env:ProgramData 'npm\etc\npmrc') '^\s*ignore-scripts\s*=' '^\s*ignore-scripts\s*=\s*true\s*$' 'ignore-scripts=true' 'system npm lifecycle-script blocking'
+        foreach ($profile in $Profiles) { Protect-ConfigDirectory $profile 'profile' }
     }
-    Set-TextConfig (Join-Path $env:ProgramData 'npm\etc\npmrc') '^\s*ignore-scripts\s*=' '^\s*ignore-scripts\s*=\s*true\s*$' 'ignore-scripts=true' 'system npm lifecycle-script blocking'
-    foreach ($profile in $Profiles) { Protect-ConfigDirectory $profile }
+    $projectDirectories = @($Manifests | ForEach-Object { Split-Path -Parent $_ } | Select-Object -Unique)
+    foreach ($projectDirectory in $projectDirectories) { Protect-ConfigDirectory $projectDirectory 'project' }
+}
+
+function Test-TextConfigCompliance {
+    param([string]$Path, [string]$MatchPattern, [string]$CorrectPattern)
+    if (-not [IO.File]::Exists($Path)) { return $false }
+    try {
+        $matching = @([IO.File]::ReadAllLines($Path) | Where-Object { $_ -match $MatchPattern })
+        return $matching.Count -gt 0 -and @($matching | Where-Object { $_ -notmatch $CorrectPattern }).Count -eq 0
+    } catch { return $false }
+}
+
+function Test-BunConfigCompliance {
+    param([string]$Path)
+    if (-not [IO.File]::Exists($Path)) { return $false }
+    try {
+        $inside = $false; $found = $false
+        foreach ($line in [IO.File]::ReadAllLines($Path)) {
+            if ($line -match '^\s*\[install\]\s*$') { $inside = $true; continue }
+            if ($line -match '^\s*\[') { $inside = $false }
+            if ($inside -and $line -match '^\s*ignoreScripts\s*=\s*true\s*(?:#.*)?$') { $found = $true }
+        }
+        return $found
+    } catch { return $false }
+}
+
+function Verify-ConfigDirectory {
+    param([string]$Directory, [ValidateSet('profile','project')][string]$Scope = 'profile')
+    if (-not (Test-TextConfigCompliance (Join-Path $Directory '.npmrc') '^\s*ignore-scripts\s*=' '^\s*ignore-scripts\s*=\s*true\s*$')) { Add-OperationalError "npm/pnpm policy verification failed: $(Join-Path $Directory '.npmrc')" }
+    if (-not (Test-TextConfigCompliance (Join-Path $Directory '.yarnrc') '^\s*--install\.ignore-scripts\s+' '^\s*--install\.ignore-scripts\s+true\s*$')) { Add-OperationalError "Yarn Classic policy verification failed: $(Join-Path $Directory '.yarnrc')" }
+    if (-not (Test-TextConfigCompliance (Join-Path $Directory '.yarnrc.yml') '^enableScripts\s*:' '^enableScripts\s*:\s*false\s*$')) { Add-OperationalError "Yarn policy verification failed: $(Join-Path $Directory '.yarnrc.yml')" }
+    if (-not (Test-BunConfigCompliance (Join-Path $Directory '.bunfig.toml'))) { Add-OperationalError "Bun policy verification failed: $(Join-Path $Directory '.bunfig.toml')" }
+    $pnpmWorkspace = Join-Path $Directory 'pnpm-workspace.yaml'
+    if ($Scope -eq 'project' -and [IO.File]::Exists($pnpmWorkspace) -and -not (Test-TextConfigCompliance $pnpmWorkspace '^ignoreScripts\s*:' '^ignoreScripts\s*:\s*true\s*$')) {
+        Add-OperationalError "pnpm policy verification failed: $pnpmWorkspace"
+    }
 }
 
 function Verify-PackageManagerControls {
-    foreach ($manager in @('npm','pnpm','yarn','bun')) {
-        $command = Get-Command $manager -ErrorAction SilentlyContinue
-        if ($null -eq $command) { continue }
-        try {
-            switch ($manager) {
-                'npm' {
-                    $value = (& $command.Source config get ignore-scripts 2>&1 | Out-String).Trim()
-                    if ($value -eq 'true') { Write-Log 'INFO' 'Verified npm ignore-scripts=true' } else { Add-OperationalError "npm ignore-scripts verification returned: $value" }
-                }
-                'pnpm' {
-                    $value = (& $command.Source config get ignore-scripts 2>&1 | Out-String).Trim()
-                    if ($value -eq 'true') { Write-Log 'INFO' 'Verified pnpm ignore-scripts=true' } else { Write-Log 'WARN' "pnpm ignore-scripts verification returned: $value" }
-                }
-                'yarn' {
-                    $value = (& $command.Source config get enableScripts 2>&1 | Out-String).Trim()
-                    if ($value -match '^(false|0)$') { Write-Log 'INFO' 'Verified Yarn lifecycle scripts disabled' } else { Write-Log 'WARN' "Yarn verification returned: $value" }
-                }
-                'bun' { Write-Log 'INFO' 'Bun detected; user-level bunfig.toml policy was applied where profiles were discovered' }
-            }
-        } catch { Write-Log 'WARN' "Could not verify $manager configuration: $($_.Exception.Message)" }
+    param($Profiles, [string[]]$Manifests)
+    if ($script:Mode -eq 'audit') { return }
+    if (-not $script:CustomScope) {
+        if ([Environment]::GetEnvironmentVariable('NPM_CONFIG_IGNORE_SCRIPTS', 'Machine') -ne 'true') { Add-OperationalError 'Machine npm policy verification failed' }
+        if ([Environment]::GetEnvironmentVariable('YARN_ENABLE_SCRIPTS', 'Machine') -ne 'false') { Add-OperationalError 'Machine Yarn policy verification failed' }
+        $systemNpmrc = Join-Path $env:ProgramData 'npm\etc\npmrc'
+        if (-not (Test-TextConfigCompliance $systemNpmrc '^\s*ignore-scripts\s*=' '^\s*ignore-scripts\s*=\s*true\s*$')) { Add-OperationalError "System npm policy verification failed: $systemNpmrc" }
+        foreach ($profile in $Profiles) { Verify-ConfigDirectory $profile 'profile' }
     }
+    $projectDirectories = @($Manifests | ForEach-Object { Split-Path -Parent $_ } | Select-Object -Unique)
+    foreach ($projectDirectory in $projectDirectories) { Verify-ConfigDirectory $projectDirectory 'project' }
 }
 
 function Get-IocRows {
@@ -498,15 +650,24 @@ function Export-DependencyFindings {
 try {
     Write-Log 'INFO' "Shai Hulud remediation v$ToolVersion started (mode=$Mode, host=$env:COMPUTERNAME, user=$env:USERNAME)"
     Write-Log 'INFO' "Report: $ReportFile"
-    $Profiles = Get-UserProfiles
-    $Roots = @(Get-LocalScanRoots $Profiles | Select-Object -Unique)
-    if ($Roots.Count -eq 0) { Add-OperationalError 'No scan roots were discovered.' }
-    $Manifests = @(Get-TreeInventory $Roots | Select-Object -Unique)
-    Remove-KnownCaches $Profiles
-    Protect-LifecycleScripts $Profiles
-    Verify-PackageManagerControls
+    if ($Mode -eq 'remediate') { Write-Log 'INFO' "Restricted configuration backups: $ConfigBackupDirectory" }
     $IocRows = @(Get-IocRows)
-    $Findings = @(Find-VulnerableDeclarations $Manifests $IocRows)
+    $Findings = @()
+    if ($IocRows.Count -gt 0) {
+        $Profiles = Get-UserProfiles
+        $Roots = @(Get-LocalScanRoots $Profiles | Select-Object -Unique)
+        if ($Roots.Count -eq 0) {
+            Add-OperationalError 'No scan roots were discovered; no cleanup or configuration changes were attempted.'
+        } else {
+            $Manifests = @(Get-TreeInventory $Roots | Select-Object -Unique)
+            Remove-KnownCaches $Profiles
+            Protect-LifecycleScripts $Profiles $Manifests
+            Verify-PackageManagerControls $Profiles $Manifests
+            $Findings = @(Find-VulnerableDeclarations $Manifests $IocRows)
+        }
+    } else {
+        Write-Log 'ERROR' 'IOC data is unavailable; no cleanup or configuration changes were attempted'
+    }
     try {
         Export-DependencyFindings $Findings $FindingsFile
         Write-Log 'INFO' "Dependency report: $FindingsFile"
@@ -530,9 +691,15 @@ $summary = [ordered]@{
     exit_code = $ExitCode
 }
 foreach ($entry in $Stats.GetEnumerator()) { $summary[$entry.Key] = $entry.Value }
-try { [IO.File]::WriteAllText($SummaryFile, ($summary | ConvertTo-Json), (New-Object Text.UTF8Encoding($false))) } catch { Write-Log 'ERROR' "Could not write summary JSON: $($_.Exception.Message)"; $ExitCode = 20 }
+try {
+    [IO.File]::WriteAllText($SummaryFile, ($summary | ConvertTo-Json), (New-Object Text.UTF8Encoding($false)))
+} catch {
+    Add-OperationalError "Could not write summary JSON: $($_.Exception.Message)"
+    $ExitCode = 20
+    $Status = 'completed_with_errors'
+}
 
 Write-Log 'SUMMARY' "status=$Status exit_code=$ExitCode node_modules_found=$($Stats.node_modules_found) node_modules_removed=$($Stats.node_modules_removed) caches_found=$($Stats.caches_found) caches_removed=$($Stats.caches_removed) configs_needed=$($Stats.configs_needing_change) configs_updated=$($Stats.configs_updated) manifests_scanned=$($Stats.package_json_scanned) dependency_findings=$($Stats.dependency_findings) errors=$($Stats.operational_errors)"
-Write-Log 'INFO' "Machine-readable summary: $SummaryFile"
+if ([IO.File]::Exists($SummaryFile)) { Write-Log 'INFO' "Machine-readable summary: $SummaryFile" }
 try { Remove-Item -LiteralPath $WorkingDirectory -Recurse -Force -ErrorAction SilentlyContinue } catch {}
 exit $ExitCode

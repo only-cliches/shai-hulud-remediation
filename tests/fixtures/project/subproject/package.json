@@ -1,0 +1,7 @@
+{
+  "name": "clean-subproject",
+  "private": true,
+  "dependencies": {
+    "safe-package": "3.0.0"
+  }
+}

@@ -22,6 +22,7 @@ set +e
 SHAI_HULUD_MANIFEST_PARSER=node "$SCRIPT_PATH" \
   --scan-root "$RUN_DIR/project" \
   --report-dir "$RUN_DIR/reports" \
+  --backup-dir "$RUN_DIR/backups" \
   --ioc-file "$TEST_DIR/fixtures/iocs.csv" >/dev/null
 FIRST_EXIT=$?
 set -e
@@ -35,13 +36,32 @@ grep -qx 'ignore-scripts=true' "$RUN_DIR/project/.npmrc"
 grep -qx -- '--install.ignore-scripts true' "$RUN_DIR/project/.yarnrc"
 grep -qx 'enableScripts: false' "$RUN_DIR/project/.yarnrc.yml"
 [ "$(grep -c '^ignoreScripts = true$' "$RUN_DIR/project/.bunfig.toml")" -eq 1 ]
+grep -qx 'ignoreScripts: true' "$RUN_DIR/project/pnpm-workspace.yaml"
 grep -q ',bad-package,1.2.3,"1.2.3, 1.2.4",exact' "$RUN_DIR"/reports/*Dependencies*.csv
 grep -q ",'@bad/scoped,\^4.5.0,4.5.6,review-range" "$RUN_DIR"/reports/*Dependencies*.csv
 
 FIRST_SUMMARY="$(find "$RUN_DIR/reports" -name '*.json' -type f -print -quit)"
 grep -q '"node_modules_removed": 2' "$FIRST_SUMMARY"
 grep -q '"caches_removed": 1' "$FIRST_SUMMARY"
+grep -q '"configs_updated": 9' "$FIRST_SUMMARY"
+grep -q '"package_json_scanned": 2' "$FIRST_SUMMARY"
 grep -q '"dependency_findings": 2' "$FIRST_SUMMARY"
+FIRST_MANIFEST="$(find "$RUN_DIR/backups" -name manifest.tsv -type f -print -quit)"
+[ -n "$FIRST_MANIFEST" ]
+FIRST_BACKUP_DIRECTORY="${FIRST_MANIFEST%/*}"
+case "$(uname -s)" in
+  Darwin) [ "$(stat -f '%Lp' "$FIRST_BACKUP_DIRECTORY")" = "700" ] ;;
+  *) [ "$(stat -c '%a' "$FIRST_BACKUP_DIRECTORY")" = "700" ] ;;
+esac
+[ "$(grep -c '^RESTORE_FILE' "$FIRST_MANIFEST")" -eq 5 ]
+[ "$(grep -c '^DELETE_FILE' "$FIRST_MANIFEST")" -eq 4 ]
+[ "$(find "$RUN_DIR/backups" -name '*.bak' -type f | wc -l | tr -d ' ')" -eq 5 ]
+NPM_BACKUP="$(awk -F '\t' -v target="$RUN_DIR/project/.npmrc" '$1 == "RESTORE_FILE" && $2 == target {print $3}' "$FIRST_MANIFEST")"
+cmp "$TEST_DIR/fixtures/project/.npmrc" "$NPM_BACKUP"
+[ -f "$RUN_DIR/project/subproject/.npmrc" ]
+[ -f "$RUN_DIR/project/subproject/.yarnrc" ]
+[ -f "$RUN_DIR/project/subproject/.yarnrc.yml" ]
+[ -f "$RUN_DIR/project/subproject/.bunfig.toml" ]
 
 mkdir -p "$RUN_DIR/project/node_modules/recreated"
 set +e
@@ -49,12 +69,14 @@ set +e
   --audit-only \
   --scan-root "$RUN_DIR/project" \
   --report-dir "$RUN_DIR/audit-reports" \
+  --backup-dir "$RUN_DIR/audit-backups" \
   --ioc-file "$TEST_DIR/fixtures/iocs.csv" >/dev/null
 AUDIT_EXIT=$?
 set -e
 
 [ "$AUDIT_EXIT" -eq 10 ]
 [ -d "$RUN_DIR/project/node_modules/recreated" ]
+[ ! -e "$RUN_DIR/audit-backups" ]
 AUDIT_SUMMARY="$(find "$RUN_DIR/audit-reports" -name '*.json' -type f -print -quit)"
 grep -q '"mode": "audit"' "$AUDIT_SUMMARY"
 grep -q '"node_modules_removed": 0' "$AUDIT_SUMMARY"
@@ -70,6 +92,7 @@ set +e
 "$SCRIPT_PATH" \
   --scan-root "$RUN_DIR/project" \
   --report-dir "$RUN_DIR/second-reports" \
+  --backup-dir "$RUN_DIR/second-backups" \
   --ioc-file "$TEST_DIR/fixtures/iocs.csv" >/dev/null
 SECOND_EXIT=$?
 set -e
@@ -91,6 +114,7 @@ set +e
 "$SCRIPT_PATH" \
   --scan-root "$RUN_DIR/project" \
   --report-dir "$RUN_DIR/final-reports" \
+  --backup-dir "$RUN_DIR/final-backups" \
   --ioc-file "$TEST_DIR/fixtures/iocs.csv" >/dev/null
 FINAL_EXIT=$?
 set -e
@@ -98,5 +122,30 @@ set -e
 [ "$FINAL_EXIT" -eq 10 ]
 FINAL_SUMMARY="$(find "$RUN_DIR/final-reports" -name '*.json' -type f -print -quit)"
 grep -q '"configs_needing_change": 0' "$FINAL_SUMMARY"
+
+cp -R "$TEST_DIR/fixtures/project" "$RUN_DIR/invalid-ioc-project"
+mkdir -p "$RUN_DIR/invalid-ioc-project/node_modules/keep"
+set +e
+"$SCRIPT_PATH" \
+  --scan-root "$RUN_DIR/invalid-ioc-project" \
+  --report-dir "$RUN_DIR/invalid-ioc-reports" \
+  --backup-dir "$RUN_DIR/invalid-ioc-backups" \
+  --ioc-file "$TEST_DIR/fixtures/invalid-iocs.csv" >/dev/null
+INVALID_IOC_EXIT=$?
+set -e
+[ "$INVALID_IOC_EXIT" -eq 20 ]
+[ -d "$RUN_DIR/invalid-ioc-project/node_modules/keep" ]
+grep -qx 'ignore-scripts=false' "$RUN_DIR/invalid-ioc-project/.npmrc"
+
+ln -s "$RUN_DIR/invalid-ioc-project" "$RUN_DIR/symlink-scan-root"
+set +e
+"$SCRIPT_PATH" \
+  --scan-root "$RUN_DIR/symlink-scan-root" \
+  --report-dir "$RUN_DIR/symlink-root-reports" \
+  --ioc-file "$TEST_DIR/fixtures/iocs.csv" >/dev/null 2>&1
+SYMLINK_ROOT_EXIT=$?
+set -e
+[ "$SYMLINK_ROOT_EXIT" -eq 30 ]
+[ -d "$RUN_DIR/invalid-ioc-project/node_modules/keep" ]
 
 printf 'remediate-shai-hulud.sh tests passed\n'

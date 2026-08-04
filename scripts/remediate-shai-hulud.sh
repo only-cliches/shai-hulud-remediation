@@ -4,14 +4,18 @@
 
 set -u
 set -o pipefail
+umask 077
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 IOC_URL="https://raw.githubusercontent.com/wiz-sec-public/wiz-research-iocs/refs/heads/main/reports/keyv-packages.csv"
 MODE="remediate"
 IOC_FILE=""
 REPORT_DIR=""
+BACKUP_DIR=""
 CONFIG_BACKUP_DIR=""
 CONFIG_BACKUP_MANIFEST=""
+CONFIG_BACKUP_SEQUENCE=0
+SYSTEM_NPM_CONFIG=""
 CUSTOM_SCOPE=0
 ERRORS=0
 NODE_MODULES_FOUND=0
@@ -23,6 +27,12 @@ CONFIGS_UPDATED=0
 PACKAGES_SCANNED=0
 FINDINGS=0
 
+if [ "$(id -u)" -eq 0 ]; then
+  SHAI_RUNTIME_TMP="/tmp"
+else
+  SHAI_RUNTIME_TMP="${TMPDIR:-/tmp}"
+fi
+
 usage() {
   cat <<'EOF'
 Usage: remediate-shai-hulud.sh [options]
@@ -33,7 +43,8 @@ Options:
   --audit-only          Scan and report without changing the endpoint
   --ioc-file PATH       Use a pre-staged IOC CSV instead of downloading it
   --report-dir PATH     Write reports to PATH
-  --scan-root PATH      Scan only PATH (repeatable); also bounds cache/config work
+  --backup-dir PATH     Store restricted configuration backups in PATH
+  --scan-root PATH      Scan only PATH (repeatable); bounds cleanup/config work
   --help                Show this help
 
 Exit codes:
@@ -44,7 +55,7 @@ Exit codes:
 EOF
 }
 
-WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/shai-hulud.XXXXXX")" || exit 30
+WORK_DIR="$(mktemp -d "$SHAI_RUNTIME_TMP/shai-hulud.XXXXXX")" || exit 30
 ROOTS_FILE="$WORK_DIR/roots.txt"
 HOMES_FILE="$WORK_DIR/homes.txt"
 PACKAGES_FILE="$WORK_DIR/package-files.bin"
@@ -78,6 +89,14 @@ while [ "$#" -gt 0 ]; do
       REPORT_DIR="$2"
       shift
       ;;
+    --backup-dir)
+      [ "$#" -ge 2 ] || { usage >&2; exit 30; }
+      case "$2" in
+        /*) BACKUP_DIR="$2" ;;
+        *) printf 'ERROR: --backup-dir must be an absolute path: %s\n' "$2" >&2; exit 30 ;;
+      esac
+      shift
+      ;;
     --scan-root)
       [ "$#" -ge 2 ] || { usage >&2; exit 30; }
       case "$2" in
@@ -85,6 +104,7 @@ while [ "$#" -gt 0 ]; do
         *) printf 'ERROR: --scan-root must be an absolute path: %s\n' "$2" >&2; exit 30 ;;
       esac
       [ -d "$2" ] || { printf 'ERROR: scan root does not exist: %s\n' "$2" >&2; exit 30; }
+      [ ! -L "$2" ] || { printf 'ERROR: scan root must not be a symbolic link: %s\n' "$2" >&2; exit 30; }
       NORMALIZED_ROOT="${2%/}"
       [ -n "$NORMALIZED_ROOT" ] || NORMALIZED_ROOT="/"
       printf '%s\n' "$NORMALIZED_ROOT" >> "$ROOTS_FILE"
@@ -111,24 +131,21 @@ case "$OS_NAME" in
 esac
 
 if [ "$CUSTOM_SCOPE" -eq 0 ] && [ "$(id -u)" -ne 0 ]; then
-  printf 'ERROR: full-disk operation requires root. Use sudo or an elevated RMM agent.\n' >&2
+  printf 'ERROR: default-scope remediation requires root. Use sudo or an elevated RMM agent.\n' >&2
   exit 30
 fi
 
 default_report_dir() {
-  if [ "$OS_NAME" = "Darwin" ]; then
-    local console_user console_home
-    console_user="$(stat -f '%Su' /dev/console 2>/dev/null || true)"
-    if [ -n "$console_user" ] && [ "$console_user" != "root" ] && [ "$console_user" != "loginwindow" ]; then
-      console_home="$(dscl . -read "/Users/$console_user" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
-      if [ -n "$console_home" ]; then
-        printf '%s/Desktop\n' "$console_home"
-        return
-      fi
+  if [ "$(id -u)" -eq 0 ]; then
+    if [ "$OS_NAME" = "Darwin" ]; then
+      printf '/Library/Logs/Shai-Hulud-Remediation\n'
+    else
+      printf '/var/log/Shai-Hulud-Remediation\n'
     fi
-    printf '/Users/Shared\n'
+  elif [ -n "${HOME:-}" ] && [ -d "$HOME" ] && [ ! -L "$HOME" ]; then
+    printf '%s/.local/state/Shai-Hulud-Remediation/Reports\n' "$HOME"
   else
-    printf '%s/Desktop\n' "${HOME:-/root}"
+    mktemp -d "$SHAI_RUNTIME_TMP/shai-hulud-reports.XXXXXX"
   fi
 }
 
@@ -136,18 +153,37 @@ if [ -z "$REPORT_DIR" ]; then
   REPORT_DIR="$(default_report_dir)"
 fi
 if ! mkdir -p -- "$REPORT_DIR" 2>/dev/null; then
-  REPORT_DIR="/var/tmp/Shai-Hulud-Remediation"
-  mkdir -p -- "$REPORT_DIR" || { printf 'ERROR: cannot create a report directory.\n' >&2; exit 30; }
+  REPORT_DIR="$(mktemp -d "$SHAI_RUNTIME_TMP/shai-hulud-reports.XXXXXX")" || { printf 'ERROR: cannot create a report directory.\n' >&2; exit 30; }
 fi
+[ ! -L "$REPORT_DIR" ] || { printf 'ERROR: report directory must not be a symbolic link: %s\n' "$REPORT_DIR" >&2; exit 30; }
 
 RUN_ID="$(date -u '+%Y%m%dT%H%M%SZ')-$$"
 REPORT_FILE="$REPORT_DIR/Shai-Hulud-Remediation-$RUN_ID.log"
 SUMMARY_FILE="$REPORT_DIR/Shai-Hulud-Remediation-$RUN_ID.json"
 FINAL_FINDINGS_FILE="$REPORT_DIR/Shai-Hulud-Dependencies-$RUN_ID.csv"
-CONFIG_BACKUP_DIR="$REPORT_DIR/Shai-Hulud-Config-Backups-$RUN_ID"
+if [ -n "$BACKUP_DIR" ]; then
+  CONFIG_BACKUP_DIR="$BACKUP_DIR/$RUN_ID"
+elif [ "$(id -u)" -eq 0 ]; then
+  if [ "$OS_NAME" = "Darwin" ]; then
+    CONFIG_BACKUP_DIR="/Library/Application Support/Shai-Hulud-Remediation/Backups/$RUN_ID"
+  else
+    CONFIG_BACKUP_DIR="/var/lib/Shai-Hulud-Remediation/Backups/$RUN_ID"
+  fi
+elif [ -n "${HOME:-}" ] && [ -d "$HOME" ] && [ ! -L "$HOME" ]; then
+  CONFIG_BACKUP_DIR="$HOME/.local/state/Shai-Hulud-Remediation/Backups/$RUN_ID"
+else
+  CONFIG_BACKUP_DIR="$SHAI_RUNTIME_TMP/shai-hulud-backups-$RUN_ID"
+fi
 CONFIG_BACKUP_MANIFEST="$CONFIG_BACKUP_DIR/manifest.tsv"
-mkdir -p -- "$CONFIG_BACKUP_DIR" || { printf 'ERROR: cannot create config backup directory.\n' >&2; exit 30; }
-: > "$CONFIG_BACKUP_MANIFEST"
+if [ "$MODE" = "remediate" ]; then
+  CONFIG_BACKUP_PARENT="${CONFIG_BACKUP_DIR%/*}"
+  mkdir -p -- "$CONFIG_BACKUP_PARENT" || { printf 'ERROR: cannot create config backup parent directory.\n' >&2; exit 30; }
+  [ ! -L "$CONFIG_BACKUP_PARENT" ] || { printf 'ERROR: config backup parent must not be a symbolic link: %s\n' "$CONFIG_BACKUP_PARENT" >&2; exit 30; }
+  [ ! -e "$CONFIG_BACKUP_DIR" ] || { printf 'ERROR: config backup run directory already exists: %s\n' "$CONFIG_BACKUP_DIR" >&2; exit 30; }
+  mkdir -p -m 700 -- "$CONFIG_BACKUP_DIR" || { printf 'ERROR: cannot create restricted config backup directory.\n' >&2; exit 30; }
+  chmod 700 "$CONFIG_BACKUP_DIR" || { printf 'ERROR: cannot restrict config backup directory.\n' >&2; exit 30; }
+  printf 'Action\tTarget\tBackupOrValue\n' > "$CONFIG_BACKUP_MANIFEST" || { printf 'ERROR: cannot create config backup manifest.\n' >&2; exit 30; }
+fi
 touch "$REPORT_FILE" || { printf 'ERROR: cannot create report: %s\n' "$REPORT_FILE" >&2; exit 30; }
 exec > >(tee -a "$REPORT_FILE") 2>&1
 
@@ -169,34 +205,39 @@ discover_roots() {
   # Default scope is intentionally broad across user and common CI workspaces,
   # but avoids scanning installed applications and entire system volumes.
   if [ "$OS_NAME" = "Darwin" ]; then
-    for candidate in /Users/* /var/root /Library/Developer /Library/CI /opt/ci /opt/build; do
-      [ -d "$candidate" ] && printf '%s\n' "$candidate" >> "$ROOTS_FILE"
+    for candidate in /Users/* /var/root /Library/Developer /Library/CI /opt/ci /opt/build /workspace /workspaces /builds /Volumes/*/workspace /Volumes/*/workspaces /Volumes/*/builds /Volumes/*/agent/_work; do
+      [ -d "$candidate" ] && [ ! -L "$candidate" ] && printf '%s\n' "$candidate" >> "$ROOTS_FILE"
     done
   else
-    for candidate in /home/* /root /srv /opt/ci /opt/build /var/lib/jenkins /var/lib/gitlab-runner /var/lib/buildkite-agent /var/lib/github-runner; do
-      [ -d "$candidate" ] && printf '%s\n' "$candidate" >> "$ROOTS_FILE"
+    for candidate in /home/* /root /srv /opt/ci /opt/build /var/lib/jenkins /var/lib/gitlab-runner /var/lib/buildkite-agent /var/lib/github-runner /workspace /workspaces /builds /mnt/*/workspace /mnt/*/workspaces /mnt/*/builds /mnt/*/agent/_work; do
+      [ -d "$candidate" ] && [ ! -L "$candidate" ] && printf '%s\n' "$candidate" >> "$ROOTS_FILE"
     done
   fi
+
+  # Include non-standard profile locations discovered from the account database.
+  while IFS= read -r candidate; do
+    [ -d "$candidate" ] && [ ! -L "$candidate" ] && printf '%s\n' "$candidate" >> "$ROOTS_FILE"
+  done < "$HOMES_FILE"
 
   [ -s "$ROOTS_FILE" ] || { printf 'ERROR: no default scan roots were discovered; use --scan-root.\n' >&2; exit 30; }
 }
 
 discover_homes() {
   [ "$CUSTOM_SCOPE" -eq 0 ] || return
-  [ -n "${HOME:-}" ] && printf '%s\n' "$HOME" >> "$HOMES_FILE"
+  [ -n "${HOME:-}" ] && [ -d "$HOME" ] && [ ! -L "$HOME" ] && printf '%s\n' "$HOME" >> "$HOMES_FILE"
   if [ "$OS_NAME" = "Darwin" ]; then
-    [ -d /var/root ] && printf '/var/root\n' >> "$HOMES_FILE"
+    [ -d /var/root ] && [ ! -L /var/root ] && printf '/var/root\n' >> "$HOMES_FILE"
     for candidate in /Users/*; do
-      [ -d "$candidate" ] && printf '%s\n' "$candidate" >> "$HOMES_FILE"
+      [ -d "$candidate" ] && [ ! -L "$candidate" ] && printf '%s\n' "$candidate" >> "$HOMES_FILE"
     done
   else
-    [ -d /root ] && printf '/root\n' >> "$HOMES_FILE"
+    [ -d /root ] && [ ! -L /root ] && printf '/root\n' >> "$HOMES_FILE"
     for candidate in /home/*; do
-      [ -d "$candidate" ] && printf '%s\n' "$candidate" >> "$HOMES_FILE"
+      [ -d "$candidate" ] && [ ! -L "$candidate" ] && printf '%s\n' "$candidate" >> "$HOMES_FILE"
     done
     if [ -r /etc/passwd ]; then
       awk -F: '$3 == 0 || $3 >= 1000 { if ($6 ~ /^\//) print $6 }' /etc/passwd | while IFS= read -r candidate; do
-        [ -d "$candidate" ] && printf '%s\n' "$candidate" >> "$HOMES_FILE"
+        [ -d "$candidate" ] && [ ! -L "$candidate" ] && printf '%s\n' "$candidate" >> "$HOMES_FILE"
       done
     fi
   fi
@@ -253,12 +294,13 @@ scan_node_modules_and_projects() {
 }
 
 clean_known_caches() {
-  local user_home cache_path root project_cache
+  local user_home cache_path
   if [ "$CUSTOM_SCOPE" -eq 0 ]; then
     while IFS= read -r user_home; do
       for cache_path in \
         "$user_home/.npm" \
         "$user_home/.npm-cache" \
+        "$user_home/.pnpm-store" \
         "$user_home/.local/share/pnpm/store" \
         "$user_home/.cache/pnpm" \
         "$user_home/.cache/yarn" \
@@ -281,6 +323,15 @@ clean_known_caches() {
 
 }
 
+clean_project_caches() {
+  local root project_cache
+  while IFS= read -r root; do
+    while IFS= read -r -d '' project_cache; do
+      remove_directory "$project_cache" "project package cache"
+    done < <(find "$root" -xdev \( -type d -o -type l \) \( -path '*/.yarn/cache' -o -name .pnpm-store \) -prune -print0 2>> "$FIND_ERRORS")
+  done < "$ROOTS_FILE"
+}
+
 config_is_compliant() {
   local file match_regex correct_regex casefold
   file="$1"
@@ -300,20 +351,30 @@ config_is_compliant() {
   ' "$file"
 }
 
-backup_config_file() {
-  local file encoded backup
+record_config_rollback() {
+  local file backup
   file="$1"
-  [ -e "$file" ] || [ -L "$file" ] || return 0
+  if [ ! -e "$file" ] && [ ! -L "$file" ]; then
+    if printf 'DELETE_FILE\t%s\t-\n' "$file" >> "$CONFIG_BACKUP_MANIFEST"; then
+      return 0
+    fi
+    record_error "Could not record rollback action for new config: $file"
+    return 1
+  fi
   if [ -L "$file" ]; then
     record_error "Refusing to modify symlinked config: $file"
     return 1
   fi
-  encoded="$(printf '%s' "$file" | tr '/:' '__')"
-  backup="$CONFIG_BACKUP_DIR/$encoded"
+  CONFIG_BACKUP_SEQUENCE=$((CONFIG_BACKUP_SEQUENCE + 1))
+  backup="$CONFIG_BACKUP_DIR/$(printf '%06d.bak' "$CONFIG_BACKUP_SEQUENCE")"
   if cp -p -- "$file" "$backup" 2>/dev/null; then
-    printf '%s\t%s\n' "$file" "$backup" >> "$CONFIG_BACKUP_MANIFEST"
-    log "INFO" "Backed up config: $file -> $backup"
-    return 0
+    if printf 'RESTORE_FILE\t%s\t%s\n' "$file" "$backup" >> "$CONFIG_BACKUP_MANIFEST"; then
+      log "INFO" "Backed up config: $file -> $backup"
+      return 0
+    fi
+    rm -f -- "$backup"
+    record_error "Could not record backup manifest entry for config: $file"
+    return 1
   fi
   record_error "Could not back up config: $file"
   return 1
@@ -333,10 +394,17 @@ apply_config_metadata() {
     group="$(stat -c '%g' "$reference" 2>/dev/null || true)"
     if [ -e "$destination" ]; then mode="$(stat -c '%a' "$destination" 2>/dev/null || printf 644)"; else mode=644; fi
   fi
-  chmod "$mode" "$temporary" 2>/dev/null || record_error "Could not preserve mode for config: $destination"
-  if [ -n "$owner" ] && [ -n "$group" ]; then
-    chown "$owner:$group" "$temporary" 2>/dev/null || record_error "Could not preserve ownership for config: $destination"
+  if ! chmod "$mode" "$temporary" 2>/dev/null; then
+    record_error "Could not preserve mode for config: $destination"
+    return 1
   fi
+  if [ -n "$owner" ] && [ -n "$group" ]; then
+    if ! chown "$owner:$group" "$temporary" 2>/dev/null; then
+      record_error "Could not preserve ownership for config: $destination"
+      return 1
+    fi
+  fi
+  return 0
 }
 
 write_equals_config() {
@@ -346,7 +414,7 @@ write_equals_config() {
   CONFIGS_NEEDED=$((CONFIGS_NEEDED + 1))
   [ "$MODE" = "remediate" ] || { log "AUDIT" "Would enforce $label in $file"; return; }
   [ ! -L "$file" ] || { record_error "Refusing to modify symlinked config: $file"; return; }
-  backup_config_file "$file" || { [ -e "$file" ] || return; }
+  record_config_rollback "$file" || return
   dir="${file%/*}"; [ "$dir" = "$file" ] && dir="."
   mkdir -p -- "$dir" 2>/dev/null || { record_error "Cannot create config directory: $dir"; return; }
   tmp="$(mktemp "$dir/.shai-hulud-config.XXXXXX")" || { record_error "Cannot create temporary config for $file"; return; }
@@ -363,7 +431,7 @@ write_equals_config() {
     { print }
     END { if (!found) print key "=" value }
   ' "$input" > "$tmp" || { rm -f -- "$tmp"; record_error "Failed to transform config: $file"; return; }
-  apply_config_metadata "$tmp" "$file" "$dir"
+  apply_config_metadata "$tmp" "$file" "$dir" || { rm -f -- "$tmp"; return; }
   if mv -- "$tmp" "$file"; then
     CONFIGS_UPDATED=$((CONFIGS_UPDATED + 1)); log "INFO" "Enforced $label in $file"
   else
@@ -378,7 +446,7 @@ write_space_config() {
   CONFIGS_NEEDED=$((CONFIGS_NEEDED + 1))
   [ "$MODE" = "remediate" ] || { log "AUDIT" "Would enforce $label in $file"; return; }
   [ ! -L "$file" ] || { record_error "Refusing to modify symlinked config: $file"; return; }
-  backup_config_file "$file" || { [ -e "$file" ] || return; }
+  record_config_rollback "$file" || return
   dir="${file%/*}"; [ "$dir" = "$file" ] && dir="."
   mkdir -p -- "$dir" 2>/dev/null || { record_error "Cannot create config directory: $dir"; return; }
   tmp="$(mktemp "$dir/.shai-hulud-config.XXXXXX")" || { record_error "Cannot create temporary config for $file"; return; }
@@ -395,7 +463,7 @@ write_space_config() {
     { print }
     END { if (!found) print key " " value }
   ' "$input" > "$tmp" || { rm -f -- "$tmp"; record_error "Failed to transform config: $file"; return; }
-  apply_config_metadata "$tmp" "$file" "$dir"
+  apply_config_metadata "$tmp" "$file" "$dir" || { rm -f -- "$tmp"; return; }
   if mv -- "$tmp" "$file"; then
     CONFIGS_UPDATED=$((CONFIGS_UPDATED + 1)); log "INFO" "Enforced $label in $file"
   else
@@ -406,11 +474,11 @@ write_space_config() {
 write_colon_config() {
   local file key value label dir tmp input
   file="$1"; key="$2"; value="$3"; label="$4"
-  if config_is_compliant "$file" "^[[:space:]]*$key[[:space:]]*:" "^[[:space:]]*$key[[:space:]]*:[[:space:]]*$value[[:space:]]*(#.*)?$" "false"; then return; fi
+  if config_is_compliant "$file" "^$key[[:space:]]*:" "^$key[[:space:]]*:[[:space:]]*$value[[:space:]]*(#.*)?$" "false"; then return; fi
   CONFIGS_NEEDED=$((CONFIGS_NEEDED + 1))
   [ "$MODE" = "remediate" ] || { log "AUDIT" "Would enforce $label in $file"; return; }
   [ ! -L "$file" ] || { record_error "Refusing to modify symlinked config: $file"; return; }
-  backup_config_file "$file" || { [ -e "$file" ] || return; }
+  record_config_rollback "$file" || return
   dir="${file%/*}"; [ "$dir" = "$file" ] && dir="."
   mkdir -p -- "$dir" 2>/dev/null || { record_error "Cannot create config directory: $dir"; return; }
   tmp="$(mktemp "$dir/.shai-hulud-config.XXXXXX")" || { record_error "Cannot create temporary config for $file"; return; }
@@ -419,7 +487,7 @@ write_colon_config() {
   [ -f "$input" ] || input="/dev/null"
   awk -v key="$key" -v value="$value" '
     BEGIN { found=0 }
-    $0 ~ "^[[:space:]]*" key "[[:space:]]*:" {
+    $0 ~ "^" key "[[:space:]]*:" {
       if (!found) print key ": " value
       found=1
       next
@@ -427,7 +495,7 @@ write_colon_config() {
     { print }
     END { if (!found) print key ": " value }
   ' "$input" > "$tmp" || { rm -f -- "$tmp"; record_error "Failed to transform config: $file"; return; }
-  apply_config_metadata "$tmp" "$file" "$dir"
+  apply_config_metadata "$tmp" "$file" "$dir" || { rm -f -- "$tmp"; return; }
   if mv -- "$tmp" "$file"; then
     CONFIGS_UPDATED=$((CONFIGS_UPDATED + 1)); log "INFO" "Enforced $label in $file"
   else
@@ -450,7 +518,7 @@ write_bun_config() {
   CONFIGS_NEEDED=$((CONFIGS_NEEDED + 1))
   [ "$MODE" = "remediate" ] || { log "AUDIT" "Would disable Bun lifecycle scripts in $file"; return; }
   [ ! -L "$file" ] || { record_error "Refusing to modify symlinked config: $file"; return; }
-  backup_config_file "$file" || { [ -e "$file" ] || return; }
+  record_config_rollback "$file" || return
   dir="${file%/*}"; [ "$dir" = "$file" ] && dir="."
   mkdir -p -- "$dir" 2>/dev/null || { record_error "Cannot create config directory: $dir"; return; }
   tmp="$(mktemp "$dir/.shai-hulud-config.XXXXXX")" || { record_error "Cannot create temporary config for $file"; return; }
@@ -475,7 +543,7 @@ write_bun_config() {
       else if (!section) { print ""; print "[install]"; print "ignoreScripts = true" }
     }
   ' "$input" > "$tmp" || { rm -f -- "$tmp"; record_error "Failed to transform config: $file"; return; }
-  apply_config_metadata "$tmp" "$file" "$dir"
+  apply_config_metadata "$tmp" "$file" "$dir" || { rm -f -- "$tmp"; return; }
   if mv -- "$tmp" "$file"; then
     CONFIGS_UPDATED=$((CONFIGS_UPDATED + 1)); log "INFO" "Disabled Bun lifecycle scripts in $file"
   else
@@ -484,43 +552,78 @@ write_bun_config() {
 }
 
 secure_config_directory() {
-  local directory
+  local directory scope
   directory="$1"
+  scope="${2:-profile}"
   write_equals_config "$directory/.npmrc" "ignore-scripts" "true" "npm/pnpm lifecycle-script blocking"
   write_space_config "$directory/.yarnrc" "--install.ignore-scripts" "true" "Yarn Classic lifecycle-script blocking"
   write_colon_config "$directory/.yarnrc.yml" "enableScripts" "false" "Yarn lifecycle-script blocking"
   write_bun_config "$directory/.bunfig.toml"
+  if [ "$scope" = "project" ] && [ -f "$directory/pnpm-workspace.yaml" ]; then
+    write_colon_config "$directory/pnpm-workspace.yaml" "ignoreScripts" "true" "pnpm lifecycle-script blocking"
+  fi
+}
+
+resolve_npm_global_config() {
+  local resolved
+  resolved=""
+  if command -v npm >/dev/null 2>&1; then
+    resolved="$(cd / && npm config get globalconfig --userconfig=/dev/null 2>/dev/null || true)"
+  fi
+  case "$resolved" in
+    /*) printf '%s\n' "$resolved" ;;
+    *) printf '/etc/npmrc\n' ;;
+  esac
 }
 
 enforce_script_blocking() {
-  local user_home
+  local user_home package_file project_dir
   if [ "$CUSTOM_SCOPE" -eq 0 ]; then
-    write_equals_config "/etc/npmrc" "ignore-scripts" "true" "system npm lifecycle-script blocking"
+    write_equals_config "$SYSTEM_NPM_CONFIG" "ignore-scripts" "true" "system npm lifecycle-script blocking"
     while IFS= read -r user_home; do
-      secure_config_directory "$user_home"
+      secure_config_directory "$user_home" "profile"
     done < "$HOMES_FILE"
-  else
-    log "INFO" "Custom scan scope selected; package-manager policy files were not changed"
+  fi
+
+  while IFS= read -r -d '' package_file; do
+    project_dir="${package_file%/*}"
+    secure_config_directory "$project_dir" "project"
+  done < "$PACKAGES_FILE"
+}
+
+verify_config_directory() {
+  local directory scope
+  directory="$1"
+  scope="${2:-profile}"
+  config_is_compliant "$directory/.npmrc" "^[[:space:]]*ignore-scripts[[:space:]]*=" "^[[:space:]]*ignore-scripts[[:space:]]*=[[:space:]]*true[[:space:]]*(#.*)?$" "true" || record_error "npm/pnpm policy verification failed: $directory/.npmrc"
+  config_is_compliant "$directory/.yarnrc" "^[[:space:]]*--install.ignore-scripts[[:space:]]+" "^[[:space:]]*--install.ignore-scripts[[:space:]]+true[[:space:]]*(#.*)?$" "false" || record_error "Yarn Classic policy verification failed: $directory/.yarnrc"
+  config_is_compliant "$directory/.yarnrc.yml" "^enableScripts[[:space:]]*:" "^enableScripts[[:space:]]*:[[:space:]]*false[[:space:]]*(#.*)?$" "false" || record_error "Yarn policy verification failed: $directory/.yarnrc.yml"
+  if ! [ -f "$directory/.bunfig.toml" ] || ! awk '
+    /^\[install\][[:space:]]*$/ {inside=1; next}
+    /^\[/ {inside=0}
+    inside && /^[[:space:]]*ignoreScripts[[:space:]]*=[[:space:]]*true([[:space:]]*(#.*)?)?$/ {found=1}
+    END {exit !found}
+  ' "$directory/.bunfig.toml"; then
+    record_error "Bun policy verification failed: $directory/.bunfig.toml"
+  fi
+  if [ "$scope" = "project" ] && [ -f "$directory/pnpm-workspace.yaml" ]; then
+    config_is_compliant "$directory/pnpm-workspace.yaml" "^ignoreScripts[[:space:]]*:" "^ignoreScripts[[:space:]]*:[[:space:]]*true[[:space:]]*(#.*)?$" "false" || record_error "pnpm policy verification failed: $directory/pnpm-workspace.yaml"
   fi
 }
 
 verify_package_manager_controls() {
-  local output
-  if command -v npm >/dev/null 2>&1; then
-    output="$(npm config get ignore-scripts 2>&1 || true)"
-    [ "$output" = "true" ] && log "INFO" "Verified npm ignore-scripts=true" || record_error "npm ignore-scripts verification returned: $output"
+  local user_home package_file project_dir
+  [ "$MODE" = "remediate" ] || return
+  if [ "$CUSTOM_SCOPE" -eq 0 ]; then
+    config_is_compliant "$SYSTEM_NPM_CONFIG" "^[[:space:]]*ignore-scripts[[:space:]]*=" "^[[:space:]]*ignore-scripts[[:space:]]*=[[:space:]]*true[[:space:]]*(#.*)?$" "true" || record_error "System npm policy verification failed: $SYSTEM_NPM_CONFIG"
+    while IFS= read -r user_home; do
+      verify_config_directory "$user_home" "profile"
+    done < "$HOMES_FILE"
   fi
-  if command -v pnpm >/dev/null 2>&1; then
-    output="$(pnpm config get ignore-scripts 2>&1 || true)"
-    [ "$output" = "true" ] && log "INFO" "Verified pnpm ignore-scripts=true" || log "WARN" "pnpm ignore-scripts verification returned: $output"
-  fi
-  if command -v yarn >/dev/null 2>&1; then
-    output="$(yarn config get enableScripts 2>&1 || true)"
-    case "$output" in false|0) log "INFO" "Verified Yarn lifecycle scripts disabled" ;; *) log "WARN" "Yarn verification returned: $output" ;; esac
-  fi
-  if command -v bun >/dev/null 2>&1; then
-    log "INFO" "Bun detected; user-level bunfig.toml policy was applied where profiles were discovered"
-  fi
+  while IFS= read -r -d '' package_file; do
+    project_dir="${package_file%/*}"
+    verify_config_directory "$project_dir" "project"
+  done < "$PACKAGES_FILE"
 }
 
 obtain_iocs() {
@@ -710,21 +813,27 @@ JS
   fi
 }
 
-discover_roots
 discover_homes
-dedupe_path_file "$ROOTS_FILE"
 dedupe_path_file "$HOMES_FILE"
+discover_roots
+dedupe_path_file "$ROOTS_FILE"
+SYSTEM_NPM_CONFIG="$(resolve_npm_global_config)"
 
 log "INFO" "Shai Hulud remediation v$VERSION started (mode=$MODE, host=$(hostname 2>/dev/null || printf unknown), os=$OS_NAME)"
 log "INFO" "Report: $REPORT_FILE"
+[ "$MODE" = "remediate" ] && log "INFO" "Restricted configuration backups: $CONFIG_BACKUP_DIR"
 
-scan_node_modules_and_projects
-clean_known_caches
-enforce_script_blocking
-verify_package_manager_controls
 obtain_iocs
-
-scan_manifests
+if [ -n "$IOC_FILE" ]; then
+  scan_node_modules_and_projects
+  clean_known_caches
+  clean_project_caches
+  enforce_script_blocking
+  verify_package_manager_controls
+  scan_manifests
+else
+  log "ERROR" "IOC data is unavailable; no cleanup or configuration changes were attempted"
+fi
 
 if [ ! -f "$FINDINGS_FILE" ]; then
   printf 'Manifest,Section,Package,Declared,Malicious Versions,Match\n' > "$FINDINGS_FILE"
@@ -741,18 +850,23 @@ if [ -s "$FIND_ERRORS" ]; then
   sed 's/^/  /' "$FIND_ERRORS"
 fi
 
-AUDIT_WORK=$((NODE_MODULES_FOUND + CACHES_FOUND + CONFIGS_NEEDED))
-EXIT_CODE=0
-STATUS="completed"
-if [ "$ERRORS" -gt 0 ]; then
-  EXIT_CODE=20
-  STATUS="completed_with_errors"
-elif [ "$FINDINGS" -gt 0 ] || { [ "$MODE" = "audit" ] && [ "$AUDIT_WORK" -gt 0 ]; }; then
-  EXIT_CODE=10
-  STATUS="attention_required"
-fi
+set_final_status() {
+  AUDIT_WORK=$((NODE_MODULES_FOUND + CACHES_FOUND + CONFIGS_NEEDED))
+  EXIT_CODE=0
+  STATUS="completed"
+  if [ "$ERRORS" -gt 0 ]; then
+    EXIT_CODE=20
+    STATUS="completed_with_errors"
+  elif [ "$FINDINGS" -gt 0 ] || { [ "$MODE" = "audit" ] && [ "$AUDIT_WORK" -gt 0 ]; }; then
+    EXIT_CODE=10
+    STATUS="attention_required"
+  fi
+}
 
-cat > "$SUMMARY_FILE" <<EOF
+write_summary() {
+  local summary_tmp
+  summary_tmp="$REPORT_DIR/.Shai-Hulud-Remediation-$RUN_ID.json.tmp"
+  if ! cat > "$summary_tmp" <<EOF
 {
   "schema_version": 1,
   "tool_version": "$VERSION",
@@ -771,7 +885,19 @@ cat > "$SUMMARY_FILE" <<EOF
   "operational_errors": $ERRORS
 }
 EOF
+  then
+    rm -f -- "$summary_tmp"
+    return 1
+  fi
+  mv -- "$summary_tmp" "$SUMMARY_FILE"
+}
+
+set_final_status
+if ! write_summary; then
+  record_error "Could not write machine-readable summary: $SUMMARY_FILE"
+  set_final_status
+fi
 
 log "SUMMARY" "status=$STATUS exit_code=$EXIT_CODE node_modules_found=$NODE_MODULES_FOUND node_modules_removed=$NODE_MODULES_REMOVED caches_found=$CACHES_FOUND caches_removed=$CACHES_REMOVED configs_needed=$CONFIGS_NEEDED configs_updated=$CONFIGS_UPDATED manifests_scanned=$PACKAGES_SCANNED dependency_findings=$FINDINGS errors=$ERRORS"
-log "INFO" "Machine-readable summary: $SUMMARY_FILE"
+[ -f "$SUMMARY_FILE" ] && log "INFO" "Machine-readable summary: $SUMMARY_FILE"
 exit "$EXIT_CODE"

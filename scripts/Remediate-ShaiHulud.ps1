@@ -103,8 +103,10 @@ function Set-PrivateDirectoryAcl {
 
 $UsingDefaultReportDirectory = [string]::IsNullOrWhiteSpace($ReportDirectory)
 if ($UsingDefaultReportDirectory) {
-    $stateRoot = if ($IsAdministrator) { $env:ProgramData } elseif (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) { $env:LOCALAPPDATA } else { [IO.Path]::GetTempPath() }
-    $ReportDirectory = Join-Path $stateRoot 'Shai-Hulud-Remediation\Reports'
+    # Keep reports in a predictable, operator-accessible Windows location for
+    # both interactive and SYSTEM/RMM executions. Do not use C:\Users itself:
+    # Set-PrivateDirectoryAcl must only apply to this dedicated subdirectory.
+    $ReportDirectory = 'C:\Users\Public\Shai-Hulud-Remediation\Reports'
 }
 try {
     [void][IO.Directory]::CreateDirectory($ReportDirectory)

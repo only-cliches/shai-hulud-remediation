@@ -89,15 +89,15 @@ powershell.exe -NoProfile -NonInteractive -File .\scripts\Remediate-ShaiHulud.ps
 
 ## Reports, backups, and rollback
 
-Elevated default locations are private machine state rather than a user's or Public Desktop:
+Default report and backup locations are:
 
-| Platform | Reports | Restricted configuration backups |
-| --- | --- | --- |
-| Linux | `/var/log/Shai-Hulud-Remediation` | `/var/lib/Shai-Hulud-Remediation/Backups/<run-id>` |
-| macOS | `/Library/Logs/Shai-Hulud-Remediation` | `/Library/Application Support/Shai-Hulud-Remediation/Backups/<run-id>` |
-| Windows | `%ProgramData%\Shai-Hulud-Remediation\Reports` | `%ProgramData%\Shai-Hulud-Remediation\Backups\<run-id>` |
+| Platform | Elevated/default-scope reports | Non-elevated targeted reports | Restricted configuration backups |
+| --- | --- | --- | --- |
+| Linux | `/var/log/Shai-Hulud-Remediation` | `$HOME/.local/state/Shai-Hulud-Remediation/Reports` | `/var/lib/Shai-Hulud-Remediation/Backups/<run-id>` |
+| macOS | `/Library/Logs/Shai-Hulud-Remediation` | `$HOME/.local/state/Shai-Hulud-Remediation/Reports` | `/Library/Application Support/Shai-Hulud-Remediation/Backups/<run-id>` |
+| Windows | `C:\Users\Public\Shai-Hulud-Remediation\Reports` | `C:\Users\Public\Shai-Hulud-Remediation\Reports` | `%ProgramData%\Shai-Hulud-Remediation\Backups\<run-id>` |
 
-Non-elevated targeted Windows runs use `%LOCALAPPDATA%`; non-elevated Unix runs use `$HOME/.local/state` when available and otherwise allocate a private temporary directory. Override locations with `--report-dir` / `-ReportDirectory` and `--backup-dir` / `-BackupDirectory`. Backup directories are created with restrictive permissions or ACLs even when their parent was supplied by the operator.
+If a non-elevated Unix run cannot use `$HOME`, it allocates a private temporary report directory and prints the path. Override locations with `--report-dir` / `-ReportDirectory` and `--backup-dir` / `-BackupDirectory`. Backup directories are created with restrictive permissions or ACLs even when their parent was supplied by the operator.
 
 Each run writes:
 

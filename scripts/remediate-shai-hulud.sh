@@ -26,6 +26,11 @@ CONFIGS_NEEDED=0
 CONFIGS_UPDATED=0
 PACKAGES_SCANNED=0
 FINDINGS=0
+IDE_HOOKS_SCANNED=0
+IDE_HOOKS_FOUND=0
+IDE_HOOKS_REMOVED=0
+PERSISTENCE_FOUND=0
+PERSISTENCE_REMOVED=0
 
 if [ "$(id -u)" -eq 0 ]; then
   SHAI_RUNTIME_TMP="/tmp"
@@ -61,10 +66,16 @@ HOMES_FILE="$WORK_DIR/homes.txt"
 PACKAGES_FILE="$WORK_DIR/package-files.bin"
 FINDINGS_FILE="$WORK_DIR/findings.csv"
 FIND_ERRORS="$WORK_DIR/find-errors.log"
+HOOKS_FILE="$WORK_DIR/hooks.bin"
+PERSISTENCE_CSV="$WORK_DIR/persistence.csv"
+PAYLOAD_REFS_FILE="$WORK_DIR/payload-refs.bin"
+HOOK_METADATA="$WORK_DIR/hook-metadata.json"
 : > "$ROOTS_FILE"
 : > "$HOMES_FILE"
 : > "$PACKAGES_FILE"
 : > "$FIND_ERRORS"
+: > "$HOOKS_FILE"
+: > "$PAYLOAD_REFS_FILE"
 
 cleanup() {
   rm -rf -- "$WORK_DIR"
@@ -251,10 +262,12 @@ remove_directory() {
   local target kind
   target="$1"
   kind="$2"
-  [ -d "$target" ] || [ -L "$target" ] || return
+  [ -d "$target" ] || [ -L "$target" ] || [ -f "$target" ] || return
 
   if [ "$kind" = "node_modules" ]; then
     NODE_MODULES_FOUND=$((NODE_MODULES_FOUND + 1))
+  elif [ "$kind" = "malicious artifact" ]; then
+    PERSISTENCE_FOUND=$((PERSISTENCE_FOUND + 1))
   else
     CACHES_FOUND=$((CACHES_FOUND + 1))
   fi
@@ -267,6 +280,8 @@ remove_directory() {
   if rm -rf -- "$target" && [ ! -e "$target" ] && [ ! -L "$target" ]; then
     if [ "$kind" = "node_modules" ]; then
       NODE_MODULES_REMOVED=$((NODE_MODULES_REMOVED + 1))
+    elif [ "$kind" = "malicious artifact" ]; then
+      PERSISTENCE_REMOVED=$((PERSISTENCE_REMOVED + 1))
     else
       CACHES_REMOVED=$((CACHES_REMOVED + 1))
     fi
@@ -698,6 +713,8 @@ for path in paths:
     try:
         with open(path, encoding="utf-8-sig") as handle:
             manifest = json.load(handle)
+        if not isinstance(manifest, dict):
+            raise ValueError("manifest is not a JSON object")
     except Exception as exc:
         parse_errors.append((path, str(exc)))
         continue
@@ -767,7 +784,10 @@ const rows = [];
 const parseErrors = [];
 for (const manifestPath of paths) {
   let manifest;
-  try { manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8').replace(/^\uFEFF/, '')); }
+  try {
+    manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8').replace(/^\uFEFF/, ''));
+    if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) throw new Error('manifest is not a JSON object');
+  }
   catch (error) { parseErrors.push([manifestPath, error.message]); continue; }
   for (const section of sections) {
     const values = manifest[section];
@@ -844,6 +864,16 @@ else
   record_error "Could not publish dependency report: $FINAL_FINDINGS_FILE"
 fi
 
+if [ -s "$PERSISTENCE_CSV" ]; then
+  if cp -- "$PERSISTENCE_CSV" "$FINAL_PERSISTENCE_FILE"; then
+    log "INFO" "Persistence report: $FINAL_PERSISTENCE_FILE"
+  else
+    record_error "Could not publish persistence report: $FINAL_PERSISTENCE_FILE"
+  fi
+else
+  printf 'File,Kind,Event,Command,Action\n' > "$FINAL_PERSISTENCE_FILE"
+fi
+
 if [ -s "$FIND_ERRORS" ]; then
   FIND_ERROR_COUNT="$(wc -l < "$FIND_ERRORS" | tr -d ' ')"
   record_error "Filesystem scan reported $FIND_ERROR_COUNT access or traversal error(s)"
@@ -882,6 +912,11 @@ write_summary() {
   "configs_updated": $CONFIGS_UPDATED,
   "package_json_scanned": $PACKAGES_SCANNED,
   "dependency_findings": $FINDINGS,
+  "ide_hooks_scanned": $IDE_HOOKS_SCANNED,
+  "ide_hooks_found": $IDE_HOOKS_FOUND,
+  "ide_hooks_removed": $IDE_HOOKS_REMOVED,
+  "persistence_artifacts_found": $PERSISTENCE_FOUND,
+  "persistence_artifacts_removed": $PERSISTENCE_REMOVED,
   "operational_errors": $ERRORS
 }
 EOF
@@ -898,6 +933,6 @@ if ! write_summary; then
   set_final_status
 fi
 
-log "SUMMARY" "status=$STATUS exit_code=$EXIT_CODE node_modules_found=$NODE_MODULES_FOUND node_modules_removed=$NODE_MODULES_REMOVED caches_found=$CACHES_FOUND caches_removed=$CACHES_REMOVED configs_needed=$CONFIGS_NEEDED configs_updated=$CONFIGS_UPDATED manifests_scanned=$PACKAGES_SCANNED dependency_findings=$FINDINGS errors=$ERRORS"
-[ -f "$SUMMARY_FILE" ] && log "INFO" "Machine-readable summary: $SUMMARY_FILE"
+log "SUMMARY" "status=$STATUS exit_code=$EXIT_CODE node_modules_found=$NODE_MODULES_FOUND node_modules_removed=$NODE_MODULES_REMOVED caches_found=$CACHES_FOUND caches_removed=$CACHES_REMOVED configs_needed=$CONFIGS_NEEDED configs_updated=$CONFIGS_UPDATED manifests_scanned=$PACKAGES_SCANNED dependency_findings=$FINDINGS ide_hooks_scanned=$IDE_HOOKS_SCANNED ide_hooks_found=$IDE_HOOKS_FOUND ide_hooks_removed=$IDE_HOOKS_REMOVED persistence_found=$PERSISTENCE_FOUND persistence_removed=$PERSISTENCE_REMOVED errors=$ERRORS"
+log "INFO" "Machine-readable summary: $SUMMARY_FILE"
 exit "$EXIT_CODE"

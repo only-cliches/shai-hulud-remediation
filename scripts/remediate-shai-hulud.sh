@@ -264,6 +264,43 @@ dedupe_path_file() {
   awk 'NF && !seen[$0]++' "$1" > "$1.tmp" && mv -- "$1.tmp" "$1"
 }
 
+discover_npm_prefixes() {
+  # npm's global config is $PREFIX/etc/npmrc, not /etc/npmrc. A Node only reads
+  # /etc/npmrc when its prefix is /usr or /usr/local; Homebrew, fnm, nvm, asdf,
+  # volta, n, nodenv, and source builds all live under other prefixes and never
+  # see it. Emit every real prefix we can find (identified by a surviving
+  # bin/node, which is not itself under node_modules) so the system-wide block
+  # also covers Nodes reinstalled into those same prefixes after cleanup.
+  local user_home candidate prefix resolved
+  {
+    for candidate in /usr /usr/local /opt/homebrew /opt/local \
+      /opt/homebrew/opt/node@* /usr/local/opt/node@* \
+      /usr/local/n/versions/node/*; do
+      printf '%s\n' "$candidate"
+    done
+    if command -v node >/dev/null 2>&1; then
+      resolved="$(cd "$(dirname "$(command -v node)")/.." 2>/dev/null && pwd)"
+      [ -n "$resolved" ] && printf '%s\n' "$resolved"
+    fi
+    while IFS= read -r user_home; do
+      for candidate in \
+        "$user_home"/.nvm/versions/node/* \
+        "$user_home"/.local/share/fnm/node-versions/*/installation \
+        "$user_home"/.fnm/node-versions/*/installation \
+        "$user_home"/.asdf/installs/nodejs/* \
+        "$user_home"/.volta/tools/image/node/* \
+        "$user_home"/.nodenv/versions/* \
+        "$user_home"/n \
+        "$user_home"/.n \
+        "$user_home"/.local; do
+        printf '%s\n' "$candidate"
+      done
+    done < "$HOMES_FILE"
+  } | while IFS= read -r prefix; do
+    [ -e "$prefix/bin/node" ] && printf '%s\n' "$prefix"
+  done | awk 'NF && !seen[$0]++'
+}
+
 remove_directory() {
   local target kind
   target="$1"
@@ -607,9 +644,12 @@ resolve_npm_global_config() {
 }
 
 enforce_script_blocking() {
-  local user_home package_file project_dir
+  local user_home package_file project_dir prefix
   if [ "$CUSTOM_SCOPE" -eq 0 ]; then
     write_equals_config "$SYSTEM_NPM_CONFIG" "ignore-scripts" "true" "system npm lifecycle-script blocking"
+    while IFS= read -r prefix; do
+      write_equals_config "$prefix/etc/npmrc" "ignore-scripts" "true" "prefix npm lifecycle-script blocking ($prefix)"
+    done < <(discover_npm_prefixes)
     while IFS= read -r user_home; do
       secure_config_directory "$user_home" "profile"
     done < "$HOMES_FILE"

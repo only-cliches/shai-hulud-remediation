@@ -6,7 +6,7 @@ set -u
 set -o pipefail
 umask 077
 
-VERSION="3.1.1"
+VERSION="3.1.4"
 IOC_URL="https://raw.githubusercontent.com/wiz-sec-public/wiz-research-iocs/refs/heads/main/reports/keyv-packages.csv"
 MODE="remediate"
 IOC_FILE=""
@@ -166,6 +166,8 @@ APPLICATION_DIR_FIND_TEST=(
   -name .cache -o -name .config -o -name .local -o -name .npm
   -o -name .pnpm-store -o -name .yarn -o -name .bun -o -name .corepack
   -o -name .nvm -o -name .fnm -o -name .volta -o -name .asdf -o -name .nodenv -o -name .node-gyp
+  -o -name .cargo -o -name .gradle -o -name .m2 -o -name .terraform -o -name .tox
+  -o -name .venv -o -path '*/pkg/mod'
   -o -name .vscode -o -name .vscode-insiders -o -name .vscode-oss
   -o -name .vscode-server -o -name .vscode-server-insiders
   -o -name .cursor -o -name .cursor-server -o -name .windsurf -o -name .windsurf-server
@@ -176,12 +178,18 @@ APPLICATION_DIR_EXCEPT_IDE_FIND_TEST=(
   -name .cache -o -name .config -o -name .local -o -name .npm
   -o -name .pnpm-store -o -name .yarn -o -name .bun -o -name .corepack
   -o -name .nvm -o -name .fnm -o -name .volta -o -name .asdf -o -name .nodenv -o -name .node-gyp
+  -o -name .cargo -o -name .gradle -o -name .m2 -o -name .terraform -o -name .tox
+  -o -name .venv -o -path '*/pkg/mod'
   -o -name .vscode-insiders -o -name .vscode-oss
   -o -name .vscode-server -o -name .vscode-server-insiders
   -o -name .cursor -o -name .cursor-server -o -name .windsurf -o -name .windsurf-server
   -o -name .codex -o -name .opencode
   -o -name Applications
 )
+# Some platform-owned locations are not useful incident-response scan targets
+# and commonly reject traversal even for an elevated process. Keep these
+# exclusions in effect when --include-application-dirs is used.
+ALWAYS_EXCLUDED_DIR_FIND_TEST=(-name '')
 if [ "$OS_NAME" = "Darwin" ]; then
   APPLICATION_DIR_FIND_TEST+=(
     -o -name Library -o -name '*.app'
@@ -190,6 +198,12 @@ if [ "$OS_NAME" = "Darwin" ]; then
   APPLICATION_DIR_EXCEPT_IDE_FIND_TEST+=(
     -o -name Library -o -name '*.app'
     -o -path /System -o -path /Library -o -path /Applications
+  )
+  ALWAYS_EXCLUDED_DIR_FIND_TEST+=(
+    -o -name .Trash -o -name .Trashes -o -name .Spotlight-V100 -o -name .fseventsd
+    -o -name .DocumentRevisions-V100 -o -name .TemporaryItems -o -name .MobileBackups
+    -o -path /private/var/db -o -path /private/var/folders -o -path /private/var/protected -o -path /private/var/root
+    -o -path /var/db -o -path /var/folders -o -path /var/protected -o -path /var/root
   )
 else
   APPLICATION_DIR_FIND_TEST+=(
@@ -470,10 +484,12 @@ scan_package_manifests() {
 
     find_output="$WORK_DIR/find-$FIND_ATTEMPT_SEQUENCE.bin"
     if [ "$INCLUDE_APPLICATION_DIRS" -eq 1 ]; then
-      run_find_nul "$find_output" "$root" -xdev -type d -name node_modules -prune -o -type f -name package.json || true
+      run_find_nul "$find_output" "$root" -xdev \
+        \( -type d \( -name node_modules -o "${ALWAYS_EXCLUDED_DIR_FIND_TEST[@]}" \) -prune \) \
+        -o -type f -name package.json || true
     else
       run_find_nul "$find_output" "$root" -xdev \
-        \( -type d \( -name node_modules -o "${APPLICATION_DIR_FIND_TEST[@]}" \) -prune \) \
+        \( -type d \( -name node_modules -o "${APPLICATION_DIR_FIND_TEST[@]}" -o "${ALWAYS_EXCLUDED_DIR_FIND_TEST[@]}" \) -prune \) \
         -o -type f -name package.json || true
     fi
     while IFS= read -r -d '' package_file; do
@@ -917,6 +933,88 @@ rows = []
 parse_errors = []
 targets = set()
 
+def normalize_jsonc(text):
+    output = []
+    index = 0
+    in_string = False
+    escaped = False
+    while index < len(text):
+        char = text[index]
+        if in_string:
+            output.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            output.append(char)
+            index += 1
+            continue
+        if char == "/" and index + 1 < len(text) and text[index + 1] == "/":
+            output.extend((" ", " "))
+            index += 2
+            while index < len(text) and text[index] not in "\r\n":
+                output.append(" ")
+                index += 1
+            continue
+        if char == "/" and index + 1 < len(text) and text[index + 1] == "*":
+            output.extend((" ", " "))
+            index += 2
+            closed = False
+            while index < len(text):
+                if index + 1 < len(text) and text[index] == "*" and text[index + 1] == "/":
+                    output.extend((" ", " "))
+                    index += 2
+                    closed = True
+                    break
+                output.append(text[index] if text[index] in "\r\n" else " ")
+                index += 1
+            if not closed:
+                raise ValueError("unterminated block comment")
+            continue
+        output.append(char)
+        index += 1
+
+    comment_free = "".join(output)
+    output = []
+    index = 0
+    in_string = False
+    escaped = False
+    while index < len(comment_free):
+        char = comment_free[index]
+        if in_string:
+            output.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+        elif char == ",":
+            lookahead = index + 1
+            while lookahead < len(comment_free) and comment_free[lookahead].isspace():
+                lookahead += 1
+            if lookahead < len(comment_free) and comment_free[lookahead] in "}]":
+                output.append(" ")
+                index += 1
+                continue
+        output.append(char)
+        index += 1
+    return "".join(output)
+
+def parse_scanned_json(text):
+    normalized = normalize_jsonc(text)
+    return {} if not normalized.strip() else json.loads(normalized)
+
 def csv_safe(value):
     text = str(value)
     return "'" + text if text.lstrip(" \t\r\n").startswith(("=", "+", "-", "@")) else text
@@ -952,7 +1050,7 @@ def installed_locations(manifest_path, package_name, bad_versions):
             installed_version = "unknown"
             try:
                 with open(os.path.join(package_path, "package.json"), encoding="utf-8-sig") as handle:
-                    installed_manifest = json.load(handle)
+                    installed_manifest = parse_scanned_json(handle.read())
                 value = installed_manifest.get("version") if isinstance(installed_manifest, dict) else None
                 if value is not None and str(value).strip():
                     installed_version = str(value).strip()
@@ -973,7 +1071,7 @@ def installed_locations(manifest_path, package_name, bad_versions):
 for path in paths:
     try:
         with open(path, encoding="utf-8-sig") as handle:
-            manifest = json.load(handle)
+            manifest = parse_scanned_json(handle.read())
         if not isinstance(manifest, dict):
             raise ValueError("manifest is not a JSON object")
     except Exception as exc:
@@ -1055,6 +1153,90 @@ const rows = [];
 const parseErrors = [];
 const targets = new Set();
 
+function normalizeJsonc(text) {
+  const output = [];
+  let index = 0;
+  let inString = false;
+  let escaped = false;
+  while (index < text.length) {
+    const char = text[index];
+    if (inString) {
+      output.push(char);
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') inString = false;
+      index += 1;
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      output.push(char);
+      index += 1;
+      continue;
+    }
+    if (char === '/' && text[index + 1] === '/') {
+      output.push(' ', ' ');
+      index += 2;
+      while (index < text.length && text[index] !== '\r' && text[index] !== '\n') { output.push(' '); index += 1; }
+      continue;
+    }
+    if (char === '/' && text[index + 1] === '*') {
+      output.push(' ', ' ');
+      index += 2;
+      let closed = false;
+      while (index < text.length) {
+        if (text[index] === '*' && text[index + 1] === '/') {
+          output.push(' ', ' ');
+          index += 2;
+          closed = true;
+          break;
+        }
+        output.push(text[index] === '\r' || text[index] === '\n' ? text[index] : ' ');
+        index += 1;
+      }
+      if (!closed) throw new Error('unterminated block comment');
+      continue;
+    }
+    output.push(char);
+    index += 1;
+  }
+
+  const commentFree = output.join('');
+  output.length = 0;
+  index = 0;
+  inString = false;
+  escaped = false;
+  while (index < commentFree.length) {
+    const char = commentFree[index];
+    if (inString) {
+      output.push(char);
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') inString = false;
+      index += 1;
+      continue;
+    }
+    if (char === '"') inString = true;
+    if (char === ',') {
+      let lookahead = index + 1;
+      while (lookahead < commentFree.length && /\s/.test(commentFree[lookahead])) lookahead += 1;
+      if (lookahead < commentFree.length && (commentFree[lookahead] === '}' || commentFree[lookahead] === ']')) {
+        output.push(' ');
+        index += 1;
+        continue;
+      }
+    }
+    output.push(char);
+    index += 1;
+  }
+  return output.join('');
+}
+
+function parseScannedJson(text) {
+  const normalized = normalizeJsonc(text.replace(/^\uFEFF/, ''));
+  return normalized.trim() ? JSON.parse(normalized) : {};
+}
+
 function packageComponents(name) {
   const parts = name.split('/');
   if (name.startsWith('@')) return parts.length === 2 && parts.every(part => part && part !== '.' && part !== '..') ? parts : null;
@@ -1088,7 +1270,7 @@ function installedLocations(manifestPath, packageName, badVersions) {
     if (pathExists(packagePath) && pathExists(nodeModules)) {
       let installedVersion = 'unknown';
       try {
-        const installedManifest = JSON.parse(fs.readFileSync(pathMod.join(packagePath, 'package.json'), 'utf8').replace(/^\uFEFF/, ''));
+        const installedManifest = parseScannedJson(fs.readFileSync(pathMod.join(packagePath, 'package.json'), 'utf8'));
         if (installedManifest && typeof installedManifest === 'object' && !Array.isArray(installedManifest) && installedManifest.version != null && String(installedManifest.version).trim()) {
           installedVersion = String(installedManifest.version).trim();
         }
@@ -1108,7 +1290,7 @@ function installedLocations(manifestPath, packageName, badVersions) {
 for (const manifestPath of paths) {
   let manifest;
   try {
-    manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8').replace(/^\uFEFF/, ''));
+    manifest = parseScannedJson(fs.readFileSync(manifestPath, 'utf8'));
     if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) throw new Error('manifest is not a JSON object');
   }
   catch (error) { parseErrors.push([manifestPath, error.message]); continue; }
@@ -1253,7 +1435,9 @@ scan_ide_persistence() {
 
     find_output="$WORK_DIR/find-$FIND_ATTEMPT_SEQUENCE.bin"
     if [ "$INCLUDE_APPLICATION_DIRS" -eq 1 ]; then
-      run_find_nul "$find_output" "$root" -xdev -type d -name node_modules -prune -o -type f \( -path '*/.claude/settings.json' -o -path '*/.vscode/tasks.json' \) || true
+      run_find_nul "$find_output" "$root" -xdev \
+        \( -type d \( -name node_modules -o "${ALWAYS_EXCLUDED_DIR_FIND_TEST[@]}" \) -prune \) \
+        -o -type f \( -path '*/.claude/settings.json' -o -path '*/.vscode/tasks.json' \) || true
       while IFS= read -r -d '' hook_file; do
         printf '%s\0' "$hook_file" >> "$HOOKS_FILE"
       done < "$find_output"
@@ -1262,7 +1446,7 @@ scan_ide_persistence() {
       # file we inspect. This finds the narrow persistence surface without
       # descending through IDE extension/application state.
       run_find_nul "$find_output" "$root" -xdev \
-        \( -type d \( -name node_modules -o "${APPLICATION_DIR_EXCEPT_IDE_FIND_TEST[@]}" \) -prune \) \
+        \( -type d \( -name node_modules -o "${APPLICATION_DIR_EXCEPT_IDE_FIND_TEST[@]}" -o "${ALWAYS_EXCLUDED_DIR_FIND_TEST[@]}" \) -prune \) \
         -o \( -type d \( -name .claude -o -name .vscode \) -prune \) || true
       while IFS= read -r -d '' hook_file; do
         case "${hook_file##*/}" in
@@ -1276,10 +1460,12 @@ scan_ide_persistence() {
 
     find_output="$WORK_DIR/find-$FIND_ATTEMPT_SEQUENCE.bin"
     if [ "$INCLUDE_APPLICATION_DIRS" -eq 1 ]; then
-      run_find_nul "$find_output" "$root" -xdev -type d -name node_modules -prune -o -type f \( -name 'Math_Symbol.js' -o -name 'math_init.js' \) || true
+      run_find_nul "$find_output" "$root" -xdev \
+        \( -type d \( -name node_modules -o "${ALWAYS_EXCLUDED_DIR_FIND_TEST[@]}" \) -prune \) \
+        -o -type f \( -name 'Math_Symbol.js' -o -name 'math_init.js' \) || true
     else
       run_find_nul "$find_output" "$root" -xdev \
-        \( -type d \( -name node_modules -o "${APPLICATION_DIR_FIND_TEST[@]}" \) -prune \) \
+        \( -type d \( -name node_modules -o "${APPLICATION_DIR_FIND_TEST[@]}" -o "${ALWAYS_EXCLUDED_DIR_FIND_TEST[@]}" \) -prune \) \
         -o -type f \( -name 'Math_Symbol.js' -o -name 'math_init.js' \) || true
     fi
     while IFS= read -r -d '' payload_file; do
@@ -1288,10 +1474,12 @@ scan_ide_persistence() {
 
     find_output="$WORK_DIR/find-$FIND_ATTEMPT_SEQUENCE.bin"
     if [ "$INCLUDE_APPLICATION_DIRS" -eq 1 ]; then
-      run_find_nul "$find_output" "$root" -xdev -type d -name 'bun-dl-*' -prune || true
+      run_find_nul "$find_output" "$root" -xdev \
+        \( -type d \( "${ALWAYS_EXCLUDED_DIR_FIND_TEST[@]}" \) -prune \) \
+        -o -type d -name 'bun-dl-*' -prune || true
     else
       run_find_nul "$find_output" "$root" -xdev \
-        \( -type d \( "${APPLICATION_DIR_FIND_TEST[@]}" \) -prune \) \
+        \( -type d \( "${APPLICATION_DIR_FIND_TEST[@]}" -o "${ALWAYS_EXCLUDED_DIR_FIND_TEST[@]}" \) -prune \) \
         -o -type d -name 'bun-dl-*' -prune || true
     fi
     while IFS= read -r -d '' payload_dir; do
@@ -1364,13 +1552,94 @@ def collect_setup_refs(config_path, command):
         if (os.path.isfile(candidate) or os.path.islink(candidate)) and candidate not in payload_refs:
             payload_refs.append(candidate)
 
+def normalize_jsonc(text):
+    """Convert VS Code JSONC to strict JSON without touching string content."""
+    output = []
+    index = 0
+    in_string = False
+    escaped = False
+    while index < len(text):
+        char = text[index]
+        if in_string:
+            output.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            output.append(char)
+            index += 1
+            continue
+        if char == "/" and index + 1 < len(text) and text[index + 1] == "/":
+            output.extend((" ", " "))
+            index += 2
+            while index < len(text) and text[index] not in "\r\n":
+                output.append(" ")
+                index += 1
+            continue
+        if char == "/" and index + 1 < len(text) and text[index + 1] == "*":
+            output.extend((" ", " "))
+            index += 2
+            closed = False
+            while index < len(text):
+                if index + 1 < len(text) and text[index] == "*" and text[index + 1] == "/":
+                    output.extend((" ", " "))
+                    index += 2
+                    closed = True
+                    break
+                output.append(text[index] if text[index] in "\r\n" else " ")
+                index += 1
+            if not closed:
+                raise ValueError("unterminated block comment")
+            continue
+        output.append(char)
+        index += 1
+
+    comment_free = "".join(output)
+    output = []
+    index = 0
+    in_string = False
+    escaped = False
+    while index < len(comment_free):
+        char = comment_free[index]
+        if in_string:
+            output.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+        elif char == ",":
+            lookahead = index + 1
+            while lookahead < len(comment_free) and comment_free[lookahead].isspace():
+                lookahead += 1
+            if lookahead < len(comment_free) and comment_free[lookahead] in "}]":
+                output.append(" ")
+                index += 1
+                continue
+        output.append(char)
+        index += 1
+    return "".join(output)
+
 for config_path in paths:
     try:
         item = os.lstat(config_path)
         if stat.S_ISLNK(item.st_mode) or not stat.S_ISREG(item.st_mode):
             raise ValueError("not a regular, non-symlinked file")
         with open(config_path, encoding="utf-8-sig") as handle:
-            data = json.load(handle)
+            config_text = handle.read()
+        config_text = normalize_jsonc(config_text)
+        data = {} if not config_text.strip() else json.loads(config_text)
         if not isinstance(data, dict):
             raise ValueError("not a JSON object")
     except Exception as exc:
@@ -1511,12 +1780,93 @@ function collectSetupRefs(configPath, command) {
   }
 }
 
+function normalizeJsonc(text) {
+  const output = [];
+  let index = 0;
+  let inString = false;
+  let escaped = false;
+  while (index < text.length) {
+    const char = text[index];
+    if (inString) {
+      output.push(char);
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') inString = false;
+      index += 1;
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      output.push(char);
+      index += 1;
+      continue;
+    }
+    if (char === '/' && text[index + 1] === '/') {
+      output.push(' ', ' ');
+      index += 2;
+      while (index < text.length && text[index] !== '\r' && text[index] !== '\n') { output.push(' '); index += 1; }
+      continue;
+    }
+    if (char === '/' && text[index + 1] === '*') {
+      output.push(' ', ' ');
+      index += 2;
+      let closed = false;
+      while (index < text.length) {
+        if (text[index] === '*' && text[index + 1] === '/') {
+          output.push(' ', ' ');
+          index += 2;
+          closed = true;
+          break;
+        }
+        output.push(text[index] === '\r' || text[index] === '\n' ? text[index] : ' ');
+        index += 1;
+      }
+      if (!closed) throw new Error('unterminated block comment');
+      continue;
+    }
+    output.push(char);
+    index += 1;
+  }
+
+  const commentFree = output.join('');
+  output.length = 0;
+  index = 0;
+  inString = false;
+  escaped = false;
+  while (index < commentFree.length) {
+    const char = commentFree[index];
+    if (inString) {
+      output.push(char);
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') inString = false;
+      index += 1;
+      continue;
+    }
+    if (char === '"') inString = true;
+    if (char === ',') {
+      let lookahead = index + 1;
+      while (lookahead < commentFree.length && /\s/.test(commentFree[lookahead])) lookahead += 1;
+      if (lookahead < commentFree.length && (commentFree[lookahead] === '}' || commentFree[lookahead] === ']')) {
+        output.push(' ');
+        index += 1;
+        continue;
+      }
+    }
+    output.push(char);
+    index += 1;
+  }
+  return output.join('');
+}
+
 for (const configPath of paths) {
   let data;
   try {
     const item = fs.lstatSync(configPath);
     if (item.isSymbolicLink() || !item.isFile()) throw new Error('not a regular, non-symlinked file');
-    data = JSON.parse(fs.readFileSync(configPath, 'utf8').replace(/^\uFEFF/, ''));
+    let configText = fs.readFileSync(configPath, 'utf8').replace(/^\uFEFF/, '');
+    configText = normalizeJsonc(configText);
+    data = !configText.trim() ? {} : JSON.parse(configText);
     if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('not a JSON object');
   } catch (error) {
     errors.push([configPath, error.message]);

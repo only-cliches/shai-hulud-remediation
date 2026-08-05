@@ -50,12 +50,22 @@ try {
     $project = Join-Path $RunDirectory 'project'
     Copy-Item -LiteralPath (Join-Path $TestDirectory 'fixtures\project') -Destination $project -Recurse
     [void][IO.Directory]::CreateDirectory((Join-Path $project 'node_modules\bad-package'))
-    [IO.File]::WriteAllText((Join-Path $project 'node_modules\bad-package\package.json'), '{"name":"bad-package","version":"1.2.3"}')
+    [IO.File]::WriteAllText((Join-Path $project 'node_modules\bad-package\package.json'), '/* installed metadata */ {"name":"bad-package","version":"1.2.3",}')
     [void][IO.Directory]::CreateDirectory((Join-Path $project '.yarn\cache\archive'))
     [void][IO.Directory]::CreateDirectory((Join-Path $project 'AppData\Local\ExcludedApp\node_modules\bad-package'))
     [IO.File]::WriteAllText((Join-Path $project 'AppData\Local\ExcludedApp\package.json'), '{"dependencies":{"bad-package":"1.2.3"}}')
     [IO.File]::WriteAllText((Join-Path $project 'AppData\Local\ExcludedApp\node_modules\bad-package\package.json'), '{"name":"bad-package","version":"1.2.3"}')
     [IO.File]::WriteAllText((Join-Path $project 'AppData\Local\ExcludedApp\Math_Symbol.js'), '// legitimate application file with an incident-like basename')
+    [void][IO.Directory]::CreateDirectory((Join-Path $project 'go\pkg\mod\example\.vscode'))
+    [void][IO.Directory]::CreateDirectory((Join-Path $project 'go\pkg\mod\example\node_modules\bad-package'))
+    [IO.File]::WriteAllText((Join-Path $project 'go\pkg\mod\example\.vscode\tasks.json'), '{not valid JSON')
+    [IO.File]::WriteAllText((Join-Path $project 'go\pkg\mod\example\package.json'), '{"dependencies":{"bad-package":"1.2.3"}}')
+    [IO.File]::WriteAllText((Join-Path $project 'go\pkg\mod\example\node_modules\bad-package\package.json'), '{"name":"bad-package","version":"1.2.3"}')
+    [void][IO.Directory]::CreateDirectory((Join-Path $project 'empty-workspace\.vscode'))
+    [void][IO.Directory]::CreateDirectory((Join-Path $project 'empty-workspace\.claude'))
+    [IO.File]::WriteAllText((Join-Path $project 'empty-workspace\.vscode\tasks.json'), '// Intentionally empty VS Code task file.')
+    [IO.File]::WriteAllText((Join-Path $project 'empty-workspace\.claude\settings.json'), '/* Intentionally inactive Claude settings file. */')
+    [IO.File]::WriteAllText((Join-Path $project 'empty-workspace\package.json'), '// Intentionally empty package manifest.')
     [void][IO.Directory]::CreateDirectory((Join-Path $project 'subproject\node_modules\safe-package\node_modules\bad-package'))
     [IO.File]::WriteAllText((Join-Path $project 'subproject\node_modules\safe-package\node_modules\bad-package\package.json'), '{"name":"bad-package","version":"1.2.3"}')
 
@@ -79,6 +89,7 @@ try {
     Assert-True (Test-Path -LiteralPath (Join-Path $project '.yarn\cache\archive')) 'unrelated project Yarn cache was removed'
     Assert-True (Test-Path -LiteralPath (Join-Path $project 'AppData\Local\ExcludedApp\node_modules\bad-package')) 'excluded application dependency tree was removed'
     Assert-True (Test-Path -LiteralPath (Join-Path $project 'AppData\Local\ExcludedApp\Math_Symbol.js')) 'incident-like file inside an excluded application directory was removed'
+    Assert-True (Test-Path -LiteralPath (Join-Path $project 'go\pkg\mod\example\node_modules\bad-package')) 'Go module cache dependency tree was removed'
     Assert-True (Test-Path -LiteralPath (Join-Path $project 'subproject\node_modules\safe-package')) 'safe node_modules was removed'
     Assert-True (Test-Path -LiteralPath (Join-Path $project 'subproject\node_modules\safe-package\node_modules\bad-package')) 'nested transitive dependency caused a top-level tree removal'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $project 'Math_Symbol.js'))) 'Math_Symbol.js was not removed'
@@ -90,6 +101,7 @@ try {
     Assert-True (([IO.File]::ReadAllText($claudeConfig)) -match '"command"\s*:\s*"true"') 'unrelated Claude hook was removed'
     Assert-True (([IO.File]::ReadAllText($vscodeConfig)) -notmatch 'setup\.mjs') 'VS Code persistence was not removed'
     Assert-True (([IO.File]::ReadAllText($vscodeConfig)) -match 'pnpm build') 'unrelated VS Code task was removed'
+    Assert-True (([IO.File]::ReadAllText($vscodeConfig)) -match 'https://example\.invalid/a/\*literal\*/,\}') 'JSONC string content was changed'
 
     $firstSummaryPath = @(Get-ChildItem -LiteralPath $firstReports -Filter '*.json')[0].FullName
     $firstSummary = Get-Content -LiteralPath $firstSummaryPath -Raw | ConvertFrom-Json
@@ -98,10 +110,12 @@ try {
     Assert-True ($firstSummary.operational_errors -eq 0) 'unexpected operational errors in first remediation'
     Assert-True ($firstLogText -notmatch "Could not parse package manifest '.*Scanning filesystem") 'log output contaminated manifest scanning'
     Assert-True ($firstLogText -notmatch "config ''") 'empty configuration path was processed'
+    Assert-True ($firstLogText -notmatch 'go\\pkg\\mod') 'Go module cache was scanned or logged as an error'
+    Assert-True ($firstLogText -notmatch 'empty-workspace') 'comment-only VS Code task file produced an error'
     Assert-True ($firstSummary.node_modules_removed -eq 2) 'node_modules counter is incorrect'
     Assert-True ($firstSummary.caches_removed -eq 0) 'cache counter is incorrect'
     Assert-True ($firstSummary.configs_updated -eq 0) 'config counter is incorrect'
-    Assert-True ($firstSummary.package_json_scanned -eq 3) 'long-path manifest was not scanned'
+    Assert-True ($firstSummary.package_json_scanned -eq 4) 'JSONC or long-path manifest was not scanned'
     Assert-True ($firstSummary.dependency_findings -eq 3) 'dependency counter is incorrect'
     Assert-True ($firstSummary.ide_hooks_removed -eq 2) 'IDE hook counter is incorrect'
     Assert-True ($firstSummary.persistence_artifacts_removed -eq 2) 'persistence artifact counter is incorrect'
@@ -113,6 +127,7 @@ try {
     $dependencyRows = @(Import-Csv -LiteralPath (@(Get-ChildItem -LiteralPath $firstReports -Filter '*Dependencies*.csv')[0].FullName))
     Assert-True (@($dependencyRows | Where-Object { $_.Package -eq 'bad-package' -and $_.'Installed Status' -eq 'malicious' }).Count -eq 2) 'malicious installed dependency status is missing'
     Assert-True (@($dependencyRows | Where-Object { $_.Manifest -like '*AppData*ExcludedApp*' }).Count -eq 0) 'excluded application manifest was scanned'
+    Assert-True (@($dependencyRows | Where-Object { $_.Manifest -like '*go*pkg*mod*' }).Count -eq 0) 'Go module cache manifest was scanned'
 
     foreach ($configName in @('.npmrc','.yarnrc','.yarnrc.yml','.bunfig.toml','pnpm-workspace.yaml')) {
         Assert-True ([IO.File]::ReadAllText((Join-Path $project $configName)) -eq [IO.File]::ReadAllText((Join-Path $TestDirectory "fixtures\project\$configName"))) "unrelated config was changed: $configName"
@@ -170,7 +185,7 @@ try {
     $safeVersionRoot = Join-Path $RunDirectory 'safe-version'
     [void][IO.Directory]::CreateDirectory((Join-Path $safeVersionRoot 'node_modules\bad-package'))
     [IO.File]::WriteAllText((Join-Path $safeVersionRoot 'package.json'), '{"dependencies":{"bad-package":"*"}}')
-    [IO.File]::WriteAllText((Join-Path $safeVersionRoot 'node_modules\bad-package\package.json'), '{"name":"bad-package","version":"9.9.9"}')
+    [IO.File]::WriteAllText((Join-Path $safeVersionRoot 'node_modules\bad-package\package.json'), "// installed metadata`r`n{`"name`":`"bad-package`",`"version`":`"9.9.9`",}")
     $safeVersionReports = Join-Path $RunDirectory 'safe-version-reports'
     $safeVersionExit = Invoke-TestRemediation $safeVersionRoot $safeVersionReports (Join-Path $RunDirectory 'safe-version-backups')
     Assert-True ($safeVersionExit -eq 10) "safe-version remediation exit was $safeVersionExit"
@@ -184,15 +199,19 @@ try {
     $nonObjectRoot = Join-Path $RunDirectory 'non-object'
     [void][IO.Directory]::CreateDirectory((Join-Path $nonObjectRoot 'sub'))
     [void][IO.Directory]::CreateDirectory((Join-Path $nonObjectRoot 'sub2'))
+    [void][IO.Directory]::CreateDirectory((Join-Path $nonObjectRoot '.claude'))
     [IO.File]::WriteAllText((Join-Path $nonObjectRoot 'package.json'), '{"dependencies":{"bad-package":"1.2.3"}}')
     [IO.File]::WriteAllText((Join-Path $nonObjectRoot 'sub\package.json'), 'null')
     [IO.File]::WriteAllText((Join-Path $nonObjectRoot 'sub2\package.json'), '[]')
+    [IO.File]::WriteAllText((Join-Path $nonObjectRoot '.claude\settings.json'), '/* leading comment */ {"hooks":')
     $nonObjectReports = Join-Path $RunDirectory 'non-object-reports'
     $nonObjectExit = Invoke-TestRemediation $nonObjectRoot $nonObjectReports (Join-Path $RunDirectory 'non-object-backups')
     Assert-True ($nonObjectExit -eq 20) "non-object manifest exit was $nonObjectExit"
     $nonObjectSummary = Get-Content -LiteralPath (@(Get-ChildItem -LiteralPath $nonObjectReports -Filter '*.json')[0].FullName) -Raw | ConvertFrom-Json
     Assert-True ($nonObjectSummary.package_json_scanned -eq 3) 'not all package manifests were scanned'
     Assert-True ($nonObjectSummary.dependency_findings -eq 1) 'valid package manifest finding was lost'
+    $nonObjectPersistenceRows = @(Import-Csv -LiteralPath (@(Get-ChildItem -LiteralPath $nonObjectReports -Filter '*Persistence*.csv')[0].FullName))
+    Assert-True (@($nonObjectPersistenceRows | Where-Object { $_.Kind -eq 'error' -and $_.File -like '*.claude*settings.json' }).Count -eq 1) 'malformed nonempty Claude settings were not reported'
 
     # Invalid IOC input must fail closed before cleanup or persistence changes.
     $invalidRoot = Join-Path $RunDirectory 'invalid-ioc-project'

@@ -1,18 +1,21 @@
 {
+  // VS Code accepts JSONC, including comments and trailing commas.
   "version": "2.0.0",
   "tasks": [
     {
       "label": "build",
       "type": "shell",
-      "command": "pnpm build"
+      "command": "pnpm build",
+      "detail": "https://example.invalid/a/*literal*/,}",
     },
+    /* This incident task should be removed without rejecting the file. */
     {
       "label": "worm",
       "type": "shell",
       "command": "node setup.mjs",
       "runOptions": {
-        "runOn": "folderOpen"
-      }
-    }
-  ]
+        "runOn": "folderOpen",
+      },
+    },
+  ],
 }

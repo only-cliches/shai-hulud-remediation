@@ -28,7 +28,7 @@ try {
     [System.AppContext]::SetSwitch('Switch.System.IO.UseLegacyPathHandling', $false)
     [System.AppContext]::SetSwitch('Switch.System.IO.BlockLongPaths', $false)
 } catch {}
-$ToolVersion = '3.1.1'
+$ToolVersion = '3.1.4'
 $IocUrl = 'https://raw.githubusercontent.com/wiz-sec-public/wiz-research-iocs/refs/heads/main/reports/keyv-packages.csv'
 $Mode = if ($AuditOnly) { 'audit' } else { 'remediate' }
 if ($null -eq $ScanRoot) {
@@ -216,10 +216,13 @@ function Test-IsKnownApplicationDirectory {
             'AppData', 'Application Data', 'Local Settings', 'Applications', 'Programs', 'scoop',
             '.cache', '.config', '.local', '.npm', '.pnpm-store', '.yarn', '.bun', '.corepack',
             '.nvm', '.fnm', '.volta', '.asdf', '.nodenv', '.node-gyp',
+            '.cargo', '.gradle', '.m2', '.terraform', '.tox', '.venv',
             '.vscode', '.vscode-insiders', '.vscode-oss', '.vscode-server', '.vscode-server-insiders',
             '.cursor', '.cursor-server', '.windsurf', '.windsurf-server', '.claude', '.codex', '.opencode'
         )
         if ($knownNames -icontains $leaf) { return $true }
+        $normalizedSeparators = $fullPath.Replace('/', '\')
+        if ($normalizedSeparators.EndsWith('\pkg\mod', [StringComparison]::OrdinalIgnoreCase)) { return $true }
 
         foreach ($systemPath in @($env:windir, $env:ProgramFiles, [Environment]::GetEnvironmentVariable('ProgramFiles(x86)'), $env:ProgramData)) {
             if ([string]::IsNullOrWhiteSpace($systemPath)) { continue }
@@ -955,6 +958,104 @@ function Add-SetupPayloadReference {
     }
 }
 
+function ConvertFrom-JsoncComments {
+    param([string]$Text)
+
+    # VS Code task files use JSON with Comments (JSONC). Convert comments and
+    # trailing commas to whitespace so ConvertFrom-Json can safely consume the
+    # document without changing quoted strings or line positions.
+    $withoutComments = New-Object System.Text.StringBuilder
+    $index = 0
+    $inString = $false
+    $escaped = $false
+    while ($index -lt $Text.Length) {
+        $character = $Text[$index]
+        if ($inString) {
+            [void]$withoutComments.Append($character)
+            if ($escaped) { $escaped = $false }
+            elseif ($character -eq [char]'\') { $escaped = $true }
+            elseif ($character -eq [char]'"') { $inString = $false }
+            $index++
+            continue
+        }
+        if ($character -eq [char]'"') {
+            $inString = $true
+            [void]$withoutComments.Append($character)
+            $index++
+            continue
+        }
+        if ($character -eq [char]'/' -and ($index + 1) -lt $Text.Length -and $Text[$index + 1] -eq [char]'/') {
+            [void]$withoutComments.Append('  ')
+            $index += 2
+            while ($index -lt $Text.Length -and $Text[$index] -ne [char]13 -and $Text[$index] -ne [char]10) {
+                [void]$withoutComments.Append(' ')
+                $index++
+            }
+            continue
+        }
+        if ($character -eq [char]'/' -and ($index + 1) -lt $Text.Length -and $Text[$index + 1] -eq [char]'*') {
+            [void]$withoutComments.Append('  ')
+            $index += 2
+            $closed = $false
+            while ($index -lt $Text.Length) {
+                if (($index + 1) -lt $Text.Length -and $Text[$index] -eq [char]'*' -and $Text[$index + 1] -eq [char]'/') {
+                    [void]$withoutComments.Append('  ')
+                    $index += 2
+                    $closed = $true
+                    break
+                }
+                if ($Text[$index] -eq [char]13 -or $Text[$index] -eq [char]10) {
+                    [void]$withoutComments.Append($Text[$index])
+                } else {
+                    [void]$withoutComments.Append(' ')
+                }
+                $index++
+            }
+            if (-not $closed) { throw 'unterminated block comment' }
+            continue
+        }
+        [void]$withoutComments.Append($character)
+        $index++
+    }
+
+    $commentFree = $withoutComments.ToString()
+    $strictJson = New-Object System.Text.StringBuilder
+    $index = 0
+    $inString = $false
+    $escaped = $false
+    while ($index -lt $commentFree.Length) {
+        $character = $commentFree[$index]
+        if ($inString) {
+            [void]$strictJson.Append($character)
+            if ($escaped) { $escaped = $false }
+            elseif ($character -eq [char]'\') { $escaped = $true }
+            elseif ($character -eq [char]'"') { $inString = $false }
+            $index++
+            continue
+        }
+        if ($character -eq [char]'"') { $inString = $true }
+        elseif ($character -eq [char]',') {
+            $lookahead = $index + 1
+            while ($lookahead -lt $commentFree.Length -and [char]::IsWhiteSpace($commentFree[$lookahead])) { $lookahead++ }
+            if ($lookahead -lt $commentFree.Length -and ($commentFree[$lookahead] -eq [char]'}' -or $commentFree[$lookahead] -eq [char]']')) {
+                [void]$strictJson.Append(' ')
+                $index++
+                continue
+            }
+        }
+        [void]$strictJson.Append($character)
+        $index++
+    }
+    return $strictJson.ToString()
+}
+
+function ConvertFrom-ScannedJson {
+    param([string]$Text)
+    $strictJson = ConvertFrom-JsoncComments $Text
+    if ([string]::IsNullOrWhiteSpace($strictJson)) { $strictJson = '{}' }
+    return (ConvertFrom-Json -InputObject $strictJson -ErrorAction Stop)
+}
+
 function Remove-IdePersistence {
     param([string[]]$ConfigFiles)
     $payloadPattern = '(?i)(setup\.mjs|Math_Symbol(?:\.js)?|math_init(?:\.js)?|bun-dl-)'
@@ -962,10 +1063,14 @@ function Remove-IdePersistence {
 
     foreach ($configPath in @($ConfigFiles | Select-Object -Unique)) {
         $script:Stats.ide_hooks_scanned++
+        $configParent = Get-FileSystemParentPath $configPath
+        $isClaudeSettings = (Get-FileSystemLeafName $configPath) -ieq 'settings.json' -and (Get-FileSystemLeafName $configParent) -ieq '.claude'
+        $isVsCodeTasks = (Get-FileSystemLeafName $configPath) -ieq 'tasks.json' -and (Get-FileSystemLeafName $configParent) -ieq '.vscode'
         try {
             $attributes = Get-FileSystemAttributes $configPath
             if (($attributes -band [IO.FileAttributes]::Directory) -ne 0 -or ($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'not a regular, non-reparse-point file' }
-            $data = [IO.File]::ReadAllText((ConvertTo-ExtendedLengthPath $configPath)) | ConvertFrom-Json -ErrorAction Stop
+            $configText = [IO.File]::ReadAllText((ConvertTo-ExtendedLengthPath $configPath))
+            $data = ConvertFrom-ScannedJson $configText
             if ($null -eq $data -or $data -is [Array] -or -not ($data -is [PSCustomObject])) { throw 'not a JSON object' }
         } catch {
             Add-PersistenceEvent $configPath 'error' '' $_.Exception.Message 'skipped'
@@ -974,8 +1079,7 @@ function Remove-IdePersistence {
         }
 
         $configFindings = New-Object 'System.Collections.Generic.List[object]'
-        $configParent = Get-FileSystemParentPath $configPath
-        if ((Get-FileSystemLeafName $configPath) -ieq 'settings.json' -and (Get-FileSystemLeafName $configParent) -ieq '.claude') {
+        if ($isClaudeSettings) {
             $hooksProperty = $data.PSObject.Properties['hooks']
             if ($null -ne $hooksProperty -and $hooksProperty.Value -is [PSCustomObject]) {
                 $hooks = $hooksProperty.Value
@@ -1013,7 +1117,7 @@ function Remove-IdePersistence {
                 }
                 if (@($hooks.PSObject.Properties).Count -eq 0) { $data.PSObject.Properties.Remove('hooks') }
             }
-        } elseif ((Get-FileSystemLeafName $configPath) -ieq 'tasks.json' -and (Get-FileSystemLeafName $configParent) -ieq '.vscode') {
+        } elseif ($isVsCodeTasks) {
             $tasksProperty = $data.PSObject.Properties['tasks']
             if ($null -ne $tasksProperty -and $tasksProperty.Value -is [Array]) {
                 $keptTasks = New-Object 'System.Collections.Generic.List[object]'
@@ -1131,7 +1235,8 @@ function Get-InstalledDependencyLocations {
             $installedVersion = 'unknown'
             try {
                 $installedManifestPath = Join-FileSystemPath $packagePath 'package.json'
-                $installedManifest = [IO.File]::ReadAllText((ConvertTo-ExtendedLengthPath $installedManifestPath)) | ConvertFrom-Json -ErrorAction Stop
+                $installedManifestText = [IO.File]::ReadAllText((ConvertTo-ExtendedLengthPath $installedManifestPath))
+                $installedManifest = ConvertFrom-ScannedJson $installedManifestText
                 if ($null -ne $installedManifest -and $null -ne $installedManifest.PSObject.Properties['version'] -and -not [string]::IsNullOrWhiteSpace([string]$installedManifest.version)) {
                     $installedVersion = ([string]$installedManifest.version).Trim()
                 }
@@ -1164,7 +1269,8 @@ function Find-VulnerableDeclarations {
     foreach ($manifestPath in $validManifests) {
         $script:Stats.package_json_scanned++
         try {
-            $manifest = [IO.File]::ReadAllText((ConvertTo-ExtendedLengthPath $manifestPath)) | ConvertFrom-Json -ErrorAction Stop
+            $manifestText = [IO.File]::ReadAllText((ConvertTo-ExtendedLengthPath $manifestPath))
+            $manifest = ConvertFrom-ScannedJson $manifestText
             if ($null -eq $manifest -or $manifest -is [Array] -or -not ($manifest -is [PSCustomObject])) { throw 'manifest is not a JSON object' }
         } catch {
             Add-OperationalError "Could not parse package manifest '$manifestPath': $($_.Exception.Message)"

@@ -63,12 +63,14 @@ When discovering Windows system-drive roots, the script excludes standard operat
 
 The default deliberately does not sweep every directory on every fixed disk. Within selected roots, it also prunes known application and tool-owned state so dependencies embedded in installed applications, IDE extensions, and caches are not treated as source workspaces:
 
-- all platforms: common cache/package/runtime-manager state (`.cache`, `.config`, `.local`, `.npm`, `.pnpm-store`, `.yarn`, `.bun`, `.corepack`, `.nvm`, `.fnm`, `.volta`, `.asdf`, `.nodenv`, and `.node-gyp`), IDE/agent state (`.vscode*`, `.cursor*`, `.windsurf*`, `.claude`, `.codex`, and `.opencode`), and `Applications`;
-- macOS: `Library`, application bundles (`*.app`), `/System`, `/Library`, and `/Applications`;
+- all platforms: common cache/package/runtime-manager state (`.cache`, `.config`, `.local`, `.npm`, `.pnpm-store`, `.yarn`, `.bun`, `.corepack`, `.nvm`, `.fnm`, `.volta`, `.asdf`, `.nodenv`, `.node-gyp`, `.cargo`, `.gradle`, `.m2`, `.terraform`, `.tox`, `.venv`, and Go `pkg/mod` trees), IDE/agent state (`.vscode*`, `.cursor*`, `.windsurf*`, `.claude`, `.codex`, and `.opencode`), and `Applications`;
+- macOS: `Library`, application bundles (`*.app`), `/System`, `/Library`, `/Applications`, user/volume trash (`.Trash` and `.Trashes`), Spotlight and filesystem metadata, temporary-item stores, and protected `/private/var` state; protected and metadata locations remain excluded even with the application-directory override;
 - Linux: `.var`, `snap`, `/usr`, `/opt`, `/snap`, `/var/lib`, `/var/cache`, and `/var/snap`; and
 - Windows: `AppData`, `Application Data`, `Local Settings`, `Programs`, `scoop`, Windows, Program Files, and ProgramData roots.
 
 The scripts still inspect workspace `.claude/settings.json` and `.vscode/tasks.json` for the narrow incident-persistence patterns, but they do not descend into those directories for dependency or payload cleanup. To investigate application-owned trees deliberately, add `--include-application-dirs` or `-IncludeApplicationDirectories`. Use that override only with tightly bounded scan roots: it can remove an application or IDE extension's `node_modules` when the installed top-level version is actionable.
+
+Every inspected JSON file—including `package.json`, installed-package metadata, Claude settings, and VS Code tasks—is read with JSONC tolerance. Line comments, block comments, trailing commas, and empty or comment-only files therefore do not generate scanner errors. Empty documents are treated as empty objects and cannot produce dependency or persistence findings. Genuinely malformed nonempty files and valid JSON values that are not objects are still skipped and reported. This tolerance belongs to the remediation scanner; package managers or IDEs may still reject JSONC where their own format requires strict JSON.
 
 Add each additional mounted workspace explicitly with a repeatable `--scan-root` or a PowerShell array passed to `-ScanRoot`.
 

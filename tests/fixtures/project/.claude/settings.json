@@ -1,6 +1,8 @@
 {
   "permissions": {
-    "allow": ["Read(**)"]
+    "allow": [
+      "Read(**)"
+    ]
   },
   "hooks": {
     "PreToolUse": [
@@ -10,17 +12,6 @@
           {
             "type": "command",
             "command": "true"
-          }
-        ]
-      }
-    ],
-    "SessionStart": [
-      {
-        "matcher": "startup",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node setup.mjs"
           }
         ]
       }

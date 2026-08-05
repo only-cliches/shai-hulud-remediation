@@ -53,8 +53,11 @@ Default scope includes:
 
 - macOS/Linux user homes, including non-standard Linux homes from `/etc/passwd`;
 - common Jenkins, GitHub Actions, GitLab Runner, Buildkite, generic build, workspace, and CI roots;
-- corresponding named CI roots on every Windows fixed drive; and
-- Windows profiles discovered from the registry and `Users` directory.
+- corresponding named CI roots on every Windows fixed drive;
+- Windows profiles discovered from the registry and `Users` directory; and
+- non-standard top-level directories on the Windows system drive (normally `C:\`), such as `C:\src`, `C:\repos`, and `C:\projects`.
+
+When discovering Windows system-drive roots, the script excludes standard operating-system, profile, recovery, and application directories, including Windows, Users, Program Files, ProgramData, Recovery, PerfLogs, `$Recycle.Bin`, and System Volume Information. Hidden, system, and reparse-point directories are also excluded. This discovery runs only in default scope; supplying `-ScanRoot` continues to restrict the run to exactly the requested roots.
 
 The default deliberately does not sweep every directory on every fixed disk. Within selected roots, it also prunes known application and tool-owned state so dependencies embedded in installed applications, IDE extensions, and caches are not treated as source workspaces:
 

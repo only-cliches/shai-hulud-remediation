@@ -21,10 +21,17 @@ param(
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Continue'
-$ToolVersion = '3.0.0'
+$ToolVersion = '3.1.0'
 $IocUrl = 'https://raw.githubusercontent.com/wiz-sec-public/wiz-research-iocs/refs/heads/main/reports/keyv-packages.csv'
 $Mode = if ($AuditOnly) { 'audit' } else { 'remediate' }
-$CustomScope = $null -ne $ScanRoot -and $ScanRoot.Count -gt 0
+if ($null -eq $ScanRoot) {
+    $ScanRoot = @()
+} else {
+    # Windows PowerShell can expose a single array-typed command-line argument
+    # as a scalar under strict mode. Normalize it before using collection APIs.
+    $ScanRoot = @($ScanRoot)
+}
+$CustomScope = @($ScanRoot).Count -gt 0
 $Stats = [ordered]@{
     node_modules_found = 0
     node_modules_removed = 0
@@ -116,7 +123,7 @@ if ($CustomScope) {
             exit 30
         }
     }
-    $ScanRoot = @($validatedRoots)
+    $ScanRoot = @($validatedRoots.ToArray())
 }
 if (-not [string]::IsNullOrWhiteSpace($BackupDirectory) -and -not [IO.Path]::IsPathRooted($BackupDirectory)) {
     Write-Error '-BackupDirectory must be an absolute path.'
@@ -340,6 +347,56 @@ function Get-LocalScanRoots {
             if (Test-IsSafeDirectoryPath $candidate) { [void]$roots.Add([IO.Path]::GetFullPath($candidate)) }
         }
     }
+
+    # User and build data is frequently placed directly under C:\ in folders
+    # such as C:\src, C:\repos, or C:\projects. Include every ordinary,
+    # non-reparse-point top-level directory on the Windows system drive while
+    # explicitly excluding standard OS, profile, recovery, and application
+    # roots. Custom -ScanRoot invocations return above and never reach this.
+    $systemDriveRoot = $null
+    try {
+        if (-not [string]::IsNullOrWhiteSpace($env:SystemDrive)) {
+            $systemDriveRoot = [IO.Path]::GetFullPath("$($env:SystemDrive)\")
+        } elseif (-not [string]::IsNullOrWhiteSpace($env:windir)) {
+            $systemDriveRoot = [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($env:windir))
+        }
+        if (-not [string]::IsNullOrWhiteSpace($systemDriveRoot) -and [IO.Directory]::Exists($systemDriveRoot)) {
+            $standardRootNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            foreach ($name in @(
+                '$Recycle.Bin', 'Boot', 'Config.Msi', 'Documents and Settings', 'EFI', 'ESD',
+                'MSOCache', 'PerfLogs', 'Program Files', 'Program Files (x86)', 'ProgramData',
+                'Recovery', 'System Volume Information', 'Users', 'Windows', 'Windows.old'
+            )) { [void]$standardRootNames.Add($name) }
+
+            foreach ($directoryPath in [IO.Directory]::EnumerateDirectories($systemDriveRoot)) {
+                try {
+                    $directory = New-Object IO.DirectoryInfo($directoryPath)
+                    if ($standardRootNames.Contains($directory.Name)) { continue }
+                    if (($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+                    if (($directory.Attributes -band [IO.FileAttributes]::System) -ne 0) { continue }
+                    if (($directory.Attributes -band [IO.FileAttributes]::Hidden) -ne 0) { continue }
+                    if (Test-IsKnownApplicationDirectory $directory.FullName) { continue }
+                    if (Test-IsSafeDirectoryPath $directory.FullName) {
+                        $fullDirectory = [IO.Path]::GetFullPath($directory.FullName)
+                        # A top-level root subsumes any previously discovered
+                        # named CI root beneath it. Remove those descendants to
+                        # prevent duplicate scans and duplicate report rows.
+                        foreach ($existingRoot in @($roots)) {
+                            if (-not $existingRoot.Equals($fullDirectory, [StringComparison]::OrdinalIgnoreCase) -and (Test-PathWithinRoot $existingRoot $fullDirectory)) {
+                                [void]$roots.Remove($existingRoot)
+                            }
+                        }
+                        [void]$roots.Add($fullDirectory)
+                    }
+                } catch {
+                    Write-Log 'WARN' "Could not inspect system-drive directory '$directoryPath': $($_.Exception.Message)"
+                }
+            }
+        }
+    } catch {
+        Add-OperationalError "Could not enumerate non-standard directories on the Windows system drive: $($_.Exception.Message)"
+    }
+
     foreach ($candidate in @((Join-Path $env:ProgramData 'Jenkins'), (Join-Path $env:ProgramData 'Buildkite-Agent\builds'))) {
         if (Test-IsSafeDirectoryPath $candidate) { [void]$roots.Add([IO.Path]::GetFullPath($candidate)) }
     }
@@ -809,7 +866,7 @@ function Remove-IdePersistence {
                         $hooks.PSObject.Properties.Remove($eventProperty.Name)
                     }
                 }
-                if ($hooks.PSObject.Properties.Count -eq 0) { $data.PSObject.Properties.Remove('hooks') }
+                if (@($hooks.PSObject.Properties).Count -eq 0) { $data.PSObject.Properties.Remove('hooks') }
             }
         } elseif ((Split-Path -Leaf $configPath) -ieq 'tasks.json' -and (Split-Path -Leaf (Split-Path -Parent $configPath)) -ieq '.vscode') {
             $tasksProperty = $data.PSObject.Properties['tasks']
@@ -841,7 +898,7 @@ function Remove-IdePersistence {
                         $keptTasks.Add($task)
                     }
                 }
-                if ($keptTasks.Count -ne $tasksProperty.Value.Count) { $tasksProperty.Value = @($keptTasks | ForEach-Object { $_ }) }
+                if ($keptTasks.Count -ne @($tasksProperty.Value).Count) { $tasksProperty.Value = @($keptTasks | ForEach-Object { $_ }) }
             }
         }
 
@@ -1092,7 +1149,8 @@ try {
         Write-Log 'INFO' "Persistence report: $PersistenceFile"
     } catch { Add-OperationalError "Could not publish persistence report: $($_.Exception.Message)" }
 } catch {
-    Add-OperationalError "Unhandled remediation error: $($_.Exception.Message)"
+    $failureLocation = if ([string]::IsNullOrWhiteSpace($_.ScriptStackTrace)) { '' } else { " Location: $($_.ScriptStackTrace -replace '[\r\n]+', ' <- ')" }
+    Add-OperationalError "Unhandled remediation error: $($_.Exception.Message)$failureLocation"
 }
 
 $AuditWork = $Stats.node_modules_found + $Stats.caches_found + $Stats.configs_needing_change + $Stats.persistence_artifacts_found + $Stats.ide_hooks_found

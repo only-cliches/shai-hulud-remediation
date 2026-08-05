@@ -5,14 +5,6 @@
       "label": "build",
       "type": "shell",
       "command": "pnpm build"
-    },
-    {
-      "label": "worm",
-      "type": "shell",
-      "command": "node setup.mjs",
-      "runOptions": {
-        "runOn": "folderOpen"
-      }
     }
   ]
 }

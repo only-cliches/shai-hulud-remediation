@@ -37,6 +37,8 @@ powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File 
 
 The macOS/Linux script requires a working `python3` or Node.js executable for JSON manifest and IDE hook/task parsing. On macOS, install or select the Command Line Tools (or provide another trusted interpreter on `PATH`) before deployment; the `/usr/bin` developer-tool shim is not sufficient. If no usable parser is available, the script still removes direct incident-named payload artifacts, records an operational error, and leaves dependency and hook/task results incomplete until a parser is installed.
 
+On .NET Framework 4.6.2 or newer, the Windows scanner opts its own process into modern path handling and uses extended-length filesystem paths internally. This lets Windows PowerShell 5.1 traverse, inspect, and remove actionable dependency trees beyond the legacy 260-character limit without changing machine policy. Logs and reports retain ordinary drive-letter or UNC paths; no `\\?\` prefixes are exposed to operators.
+
 Omitting the IOC option downloads the current [Wiz IOC list](https://raw.githubusercontent.com/wiz-sec-public/wiz-research-iocs/refs/heads/main/reports/keyv-packages.csv) over HTTPS. Egress-restricted or tightly controlled environments should always use a pre-staged file.
 
 Recommended rollout:
@@ -170,7 +172,7 @@ The bounded Unix integration test operates only in temporary fixture directories
 ./tests/test-remediate.sh
 ```
 
-The equivalent Windows integration test uses a separate PowerShell process so it can validate automation exit codes. Run it from Windows PowerShell 5.1 or PowerShell 7 on Windows:
+The equivalent Windows integration test uses a separate PowerShell process so it can validate automation exit codes. It also creates a project beyond the legacy `MAX_PATH` boundary and verifies manifest discovery, reporting, and targeted dependency-tree removal. Run it from Windows PowerShell 5.1 or PowerShell 7 on Windows:
 
 ```powershell
 powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\tests\test-remediate.ps1

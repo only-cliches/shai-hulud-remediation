@@ -21,7 +21,14 @@ param(
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Continue'
-$ToolVersion = '3.1.0'
+# Windows PowerShell 5.1 targets an older .NET Framework compatibility mode.
+# Opt this process into the .NET 4.6.2+ path behavior before any filesystem
+# access; extended-length paths below then work without changing machine policy.
+try {
+    [System.AppContext]::SetSwitch('Switch.System.IO.UseLegacyPathHandling', $false)
+    [System.AppContext]::SetSwitch('Switch.System.IO.BlockLongPaths', $false)
+} catch {}
+$ToolVersion = '3.1.1'
 $IocUrl = 'https://raw.githubusercontent.com/wiz-sec-public/wiz-research-iocs/refs/heads/main/reports/keyv-packages.csv'
 $Mode = if ($AuditOnly) { 'audit' } else { 'remediate' }
 if ($null -eq $ScanRoot) {
@@ -55,11 +62,146 @@ function Test-IsAdministrator {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function ConvertTo-ExtendedLengthPath {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $Path }
+    if ($Path.StartsWith('\\?\', [StringComparison]::Ordinal)) { return $Path }
+    $absolutePath = if ([IO.Path]::IsPathRooted($Path)) { $Path } else { [IO.Path]::GetFullPath($Path) }
+    if ($absolutePath.StartsWith('\\', [StringComparison]::Ordinal)) {
+        return '\\?\UNC\' + $absolutePath.Substring(2)
+    }
+    return '\\?\' + $absolutePath
+}
+
+function ConvertFrom-ExtendedLengthPath {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $Path }
+    if ($Path.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) {
+        return '\\' + $Path.Substring(8)
+    }
+    if ($Path.StartsWith('\\?\', [StringComparison]::Ordinal)) { return $Path.Substring(4) }
+    return $Path
+}
+
+function Get-NormalizedFileSystemPath {
+    param([string]$Path)
+    return ConvertFrom-ExtendedLengthPath ([IO.Path]::GetFullPath((ConvertTo-ExtendedLengthPath $Path)))
+}
+
+function Join-FileSystemPath {
+    param([string]$Parent, [string]$Child)
+    if ([string]::IsNullOrWhiteSpace($Parent)) { return $Child }
+    return $Parent.TrimEnd([char[]]@('\','/')) + [IO.Path]::DirectorySeparatorChar + $Child.TrimStart([char[]]@('\','/'))
+}
+
+function Get-FileSystemLeafName {
+    param([string]$Path)
+    $normalPath = (ConvertFrom-ExtendedLengthPath $Path).TrimEnd([char[]]@('\','/'))
+    $separatorIndex = [Math]::Max($normalPath.LastIndexOf('\'), $normalPath.LastIndexOf('/'))
+    if ($separatorIndex -lt 0) { return $normalPath }
+    return $normalPath.Substring($separatorIndex + 1)
+}
+
+function Get-FileSystemParentPath {
+    param([string]$Path)
+    $extendedParent = [IO.Path]::GetDirectoryName((ConvertTo-ExtendedLengthPath $Path))
+    if ([string]::IsNullOrWhiteSpace($extendedParent)) { return $null }
+    return ConvertFrom-ExtendedLengthPath $extendedParent
+}
+
+function Get-FileSystemAttributes {
+    param([string]$Path)
+    return [IO.File]::GetAttributes((ConvertTo-ExtendedLengthPath $Path))
+}
+
+function Test-FileSystemFile {
+    param([string]$Path)
+    try {
+        $attributes = Get-FileSystemAttributes $Path
+        return ($attributes -band [IO.FileAttributes]::Directory) -eq 0
+    } catch { return $false }
+}
+
+function Test-FileSystemDirectory {
+    param([string]$Path)
+    try {
+        $attributes = Get-FileSystemAttributes $Path
+        return ($attributes -band [IO.FileAttributes]::Directory) -ne 0
+    } catch { return $false }
+}
+
+function Remove-ExtendedDirectoryTree {
+    param([string]$ExtendedPath)
+    $pending = New-Object 'System.Collections.Generic.Stack[object]'
+    $pending.Push([PSCustomObject]@{ Path = $ExtendedPath; Visited = $false })
+    while ($pending.Count -gt 0) {
+        $entry = $pending.Pop()
+        try {
+            $attributes = [IO.File]::GetAttributes($entry.Path)
+        } catch [System.IO.FileNotFoundException], [System.IO.DirectoryNotFoundException] {
+            continue
+        }
+        $isReparsePoint = ($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+        if ($isReparsePoint) {
+            [IO.Directory]::Delete($entry.Path, $false)
+            continue
+        }
+        if ($entry.Visited) {
+            $forceAttributes = [IO.FileAttributes]::ReadOnly -bor [IO.FileAttributes]::Hidden -bor [IO.FileAttributes]::System
+            if (($attributes -band $forceAttributes) -ne 0) {
+                $cleanAttributes = [IO.FileAttributes](([int]$attributes) -band (-bnot ([int]$forceAttributes)))
+                [IO.File]::SetAttributes($entry.Path, $cleanAttributes)
+            }
+            [IO.Directory]::Delete($entry.Path, $false)
+            continue
+        }
+
+        $pending.Push([PSCustomObject]@{ Path = $entry.Path; Visited = $true })
+        foreach ($childDirectory in [IO.Directory]::EnumerateDirectories($entry.Path)) {
+            $pending.Push([PSCustomObject]@{ Path = $childDirectory; Visited = $false })
+        }
+        foreach ($childFile in [IO.Directory]::EnumerateFiles($entry.Path)) {
+            $fileAttributes = [IO.File]::GetAttributes($childFile)
+            $forceAttributes = [IO.FileAttributes]::ReadOnly -bor [IO.FileAttributes]::Hidden -bor [IO.FileAttributes]::System
+            if (($fileAttributes -band $forceAttributes) -ne 0) {
+                $cleanAttributes = [IO.FileAttributes](([int]$fileAttributes) -band (-bnot ([int]$forceAttributes)))
+                if ($cleanAttributes -eq 0) { $cleanAttributes = [IO.FileAttributes]::Normal }
+                [IO.File]::SetAttributes($childFile, $cleanAttributes)
+            }
+            [IO.File]::Delete($childFile)
+        }
+    }
+}
+
+function Remove-FileSystemPath {
+    param([string]$Path, [bool]$Recursive)
+    $extendedPath = ConvertTo-ExtendedLengthPath $Path
+    $attributes = [IO.File]::GetAttributes($extendedPath)
+    $isDirectory = ($attributes -band [IO.FileAttributes]::Directory) -ne 0
+    $isReparsePoint = ($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+    if ($isDirectory) {
+        if ($Recursive -and -not $isReparsePoint) {
+            try {
+                [IO.Directory]::Delete($extendedPath, $true)
+            } catch {
+                Remove-ExtendedDirectoryTree $extendedPath
+            }
+        } else {
+            [IO.Directory]::Delete($extendedPath, $false)
+        }
+    } else {
+        if (($attributes -band [IO.FileAttributes]::ReadOnly) -ne 0) {
+            [IO.File]::SetAttributes($extendedPath, ($attributes -band (-bnot [IO.FileAttributes]::ReadOnly)))
+        }
+        [IO.File]::Delete($extendedPath)
+    }
+}
+
 function Test-IsSafeDirectoryPath {
     param([string]$Path)
     try {
-        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
-        return $item.PSIsContainer -and (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)
+        $attributes = Get-FileSystemAttributes $Path
+        return (($attributes -band [IO.FileAttributes]::Directory) -ne 0) -and (($attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)
     } catch { return $false }
 }
 
@@ -68,8 +210,8 @@ function Test-IsKnownApplicationDirectory {
     if ($script:IncludeApplicationDirectories) { return $false }
     try {
         $trimCharacters = [char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
-        $fullPath = [IO.Path]::GetFullPath($Path).TrimEnd($trimCharacters)
-        $leaf = [IO.Path]::GetFileName($fullPath)
+        $fullPath = (Get-NormalizedFileSystemPath $Path).TrimEnd($trimCharacters)
+        $leaf = Get-FileSystemLeafName $fullPath
         $knownNames = @(
             'AppData', 'Application Data', 'Local Settings', 'Applications', 'Programs', 'scoop',
             '.cache', '.config', '.local', '.npm', '.pnpm-store', '.yarn', '.bun', '.corepack',
@@ -81,7 +223,7 @@ function Test-IsKnownApplicationDirectory {
 
         foreach ($systemPath in @($env:windir, $env:ProgramFiles, [Environment]::GetEnvironmentVariable('ProgramFiles(x86)'), $env:ProgramData)) {
             if ([string]::IsNullOrWhiteSpace($systemPath)) { continue }
-            $normalizedSystemPath = [IO.Path]::GetFullPath($systemPath).TrimEnd($trimCharacters)
+            $normalizedSystemPath = (Get-NormalizedFileSystemPath $systemPath).TrimEnd($trimCharacters)
             if ($fullPath -ieq $normalizedSystemPath) { return $true }
         }
     } catch {
@@ -92,15 +234,15 @@ function Test-IsKnownApplicationDirectory {
 
 function Add-IdeConfigurationFromDirectory {
     param([string]$Directory)
-    $leaf = Split-Path -Leaf $Directory
+    $leaf = Get-FileSystemLeafName $Directory
     $ideConfig = $null
-    if ($leaf -ieq '.claude') { $ideConfig = Join-Path $Directory 'settings.json' }
-    elseif ($leaf -ieq '.vscode') { $ideConfig = Join-Path $Directory 'tasks.json' }
-    if ($null -eq $ideConfig -or -not [IO.File]::Exists($ideConfig)) { return }
+    if ($leaf -ieq '.claude') { $ideConfig = Join-FileSystemPath $Directory 'settings.json' }
+    elseif ($leaf -ieq '.vscode') { $ideConfig = Join-FileSystemPath $Directory 'tasks.json' }
+    if ($null -eq $ideConfig -or -not (Test-FileSystemFile $ideConfig)) { return }
     try {
-        $configItem = Get-Item -LiteralPath $ideConfig -Force -ErrorAction Stop
-        if (($configItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -and -not $configItem.PSIsContainer) {
-            [void]$script:IdeConfigFiles.Add($configItem.FullName)
+        $attributes = Get-FileSystemAttributes $ideConfig
+        if (($attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -and ($attributes -band [IO.FileAttributes]::Directory) -eq 0) {
+            [void]$script:IdeConfigFiles.Add((Get-NormalizedFileSystemPath $ideConfig))
         }
     } catch { Add-OperationalError "Could not inspect IDE persistence config '$ideConfig': $($_.Exception.Message)" }
 }
@@ -115,7 +257,7 @@ if ($CustomScope) {
     foreach ($root in $ScanRoot) {
         try {
             if (-not [IO.Path]::IsPathRooted($root)) { throw 'Path must be absolute' }
-            $fullRoot = [IO.Path]::GetFullPath($root)
+            $fullRoot = Get-NormalizedFileSystemPath $root
             if (-not (Test-IsSafeDirectoryPath $fullRoot)) { throw 'Directory does not exist or is a reparse point' }
             $validatedRoots.Add($fullRoot)
         } catch {
@@ -248,12 +390,14 @@ function Add-NodeModulesEvent {
 function Remove-MaliciousArtifact {
     param([string]$Path)
     try {
-        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        $attributes = Get-FileSystemAttributes $Path
     } catch { return }
 
-    $isReparsePoint = ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
-    $isKnownDirectory = $item.PSIsContainer -and $item.Name -like 'bun-dl-*'
-    $isKnownFile = -not $item.PSIsContainer -and @('Math_Symbol.js', 'math_init.js', 'setup.mjs') -contains $item.Name
+    $isDirectory = ($attributes -band [IO.FileAttributes]::Directory) -ne 0
+    $isReparsePoint = ($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+    $leafName = Get-FileSystemLeafName $Path
+    $isKnownDirectory = $isDirectory -and $leafName -like 'bun-dl-*'
+    $isKnownFile = -not $isDirectory -and @('Math_Symbol.js', 'math_init.js', 'setup.mjs') -contains $leafName
     if (-not $isKnownDirectory -and -not $isKnownFile) {
         Add-OperationalError "Safety check rejected unexpected persistence target '$Path'"
         return
@@ -266,12 +410,8 @@ function Remove-MaliciousArtifact {
         return
     }
     try {
-        if ($item.PSIsContainer -and -not $isReparsePoint) {
-            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
-        } else {
-            Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
-        }
-        if (Test-Path -LiteralPath $Path) { throw 'Target still exists after removal' }
+        Remove-FileSystemPath $Path ($isDirectory -and -not $isReparsePoint)
+        if ((Test-FileSystemFile $Path) -or (Test-FileSystemDirectory $Path)) { throw 'Target still exists after removal' }
         $script:Stats.persistence_artifacts_removed++
         Add-PersistenceEvent $Path 'payload' '' '' 'removed'
         Write-Log 'INFO' "Removed malicious artifact: $Path"
@@ -284,10 +424,11 @@ function Remove-MaliciousArtifact {
 function Remove-RemediationDirectory {
     param([string]$Path, [ValidateSet('node_modules','package cache','project package cache')][string]$Kind)
     try {
-        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        $attributes = Get-FileSystemAttributes $Path
     } catch { return }
-    $isReparsePoint = ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
-    if (-not $item.PSIsContainer -and -not $isReparsePoint) {
+    $isDirectory = ($attributes -band [IO.FileAttributes]::Directory) -ne 0
+    $isReparsePoint = ($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+    if (-not $isDirectory -and -not $isReparsePoint) {
         Add-OperationalError "Safety check rejected non-directory $Kind target '$Path'"
         return
     }
@@ -298,12 +439,8 @@ function Remove-RemediationDirectory {
         return
     }
     try {
-        if ($isReparsePoint) {
-            Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
-        } else {
-            Remove-Item -LiteralPath $Path -Force -Recurse -ErrorAction Stop
-        }
-        if (Test-Path -LiteralPath $Path) { throw 'Target still exists after removal' }
+        Remove-FileSystemPath $Path (-not $isReparsePoint)
+        if ((Test-FileSystemFile $Path) -or (Test-FileSystemDirectory $Path)) { throw 'Target still exists after removal' }
         if ($Kind -eq 'node_modules') {
             $script:Stats.node_modules_removed++
             Add-NodeModulesEvent $Path 'removed'
@@ -320,8 +457,8 @@ function Get-LocalScanRoots {
     if ($script:CustomScope) {
         foreach ($root in $script:ScanRoot) {
             try {
-                $full = [IO.Path]::GetFullPath($root)
-                if (-not [IO.Directory]::Exists($full)) { throw 'Directory does not exist' }
+                $full = Get-NormalizedFileSystemPath $root
+                if (-not (Test-FileSystemDirectory $full)) { throw 'Directory does not exist' }
                 $full
             } catch {
                 Add-OperationalError "Invalid scan root '$root': $($_.Exception.Message)"
@@ -332,7 +469,7 @@ function Get-LocalScanRoots {
 
     $roots = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     foreach ($profile in $Profiles) {
-        if (Test-IsSafeDirectoryPath $profile) { [void]$roots.Add([IO.Path]::GetFullPath($profile)) }
+        if (Test-IsSafeDirectoryPath $profile) { [void]$roots.Add((Get-NormalizedFileSystemPath $profile)) }
     }
     $fixedDrives = @()
     try {
@@ -344,7 +481,7 @@ function Get-LocalScanRoots {
     foreach ($drive in $fixedDrives) {
         foreach ($relative in @('Builds', 'agent\_work', 'actions-runner\_work', 'gitlab-runner\builds', 'workspace', 'workspaces')) {
             $candidate = Join-Path "$drive\" $relative
-            if (Test-IsSafeDirectoryPath $candidate) { [void]$roots.Add([IO.Path]::GetFullPath($candidate)) }
+            if (Test-IsSafeDirectoryPath $candidate) { [void]$roots.Add((Get-NormalizedFileSystemPath $candidate)) }
         }
     }
 
@@ -377,7 +514,7 @@ function Get-LocalScanRoots {
                     if (($directory.Attributes -band [IO.FileAttributes]::Hidden) -ne 0) { continue }
                     if (Test-IsKnownApplicationDirectory $directory.FullName) { continue }
                     if (Test-IsSafeDirectoryPath $directory.FullName) {
-                        $fullDirectory = [IO.Path]::GetFullPath($directory.FullName)
+                        $fullDirectory = Get-NormalizedFileSystemPath $directory.FullName
                         # A top-level root subsumes any previously discovered
                         # named CI root beneath it. Remove those descendants to
                         # prevent duplicate scans and duplicate report rows.
@@ -398,7 +535,7 @@ function Get-LocalScanRoots {
     }
 
     foreach ($candidate in @((Join-Path $env:ProgramData 'Jenkins'), (Join-Path $env:ProgramData 'Buildkite-Agent\builds'))) {
-        if (Test-IsSafeDirectoryPath $candidate) { [void]$roots.Add([IO.Path]::GetFullPath($candidate)) }
+        if (Test-IsSafeDirectoryPath $candidate) { [void]$roots.Add((Get-NormalizedFileSystemPath $candidate)) }
     }
     return $roots
 }
@@ -409,7 +546,7 @@ function Get-UserProfiles {
     try {
         Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\*' -ErrorAction Stop | ForEach-Object {
             $path = [Environment]::ExpandEnvironmentVariables([string]$_.ProfileImagePath)
-            if (Test-IsSafeDirectoryPath $path) { [void]$profiles.Add([IO.Path]::GetFullPath($path)) }
+            if (Test-IsSafeDirectoryPath $path) { [void]$profiles.Add((Get-NormalizedFileSystemPath $path)) }
         }
     } catch {
         Add-OperationalError "Could not enumerate profile registry entries: $($_.Exception.Message)"
@@ -437,36 +574,38 @@ function Get-TreeInventory {
         $stack.Push($root)
         while ($stack.Count -gt 0) {
             $current = $stack.Pop()
-            $manifest = Join-Path $current 'package.json'
-            if ([IO.File]::Exists($manifest)) {
+            $manifest = Join-FileSystemPath $current 'package.json'
+            if (Test-FileSystemFile $manifest) {
                 try {
-                    $manifestItem = Get-Item -LiteralPath $manifest -Force -ErrorAction Stop
-                    if (($manifestItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -and -not $manifestItem.PSIsContainer) {
-                        [void]$manifests.Add($manifestItem.FullName)
+                    $manifestAttributes = Get-FileSystemAttributes $manifest
+                    if (($manifestAttributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -and ($manifestAttributes -band [IO.FileAttributes]::Directory) -eq 0) {
+                        [void]$manifests.Add((Get-NormalizedFileSystemPath $manifest))
                     }
                 } catch { Add-OperationalError "Could not inspect package manifest '$manifest': $($_.Exception.Message)" }
             }
             Add-IdeConfigurationFromDirectory $current
             foreach ($payloadName in @('Math_Symbol.js', 'math_init.js')) {
-                $payloadPath = Join-Path $current $payloadName
-                if ([IO.File]::Exists($payloadPath)) { Remove-MaliciousArtifact $payloadPath }
+                $payloadPath = Join-FileSystemPath $current $payloadName
+                if (Test-FileSystemFile $payloadPath) { Remove-MaliciousArtifact $payloadPath }
             }
             try {
-                foreach ($directoryPath in [IO.Directory]::EnumerateDirectories($current)) {
-                    $directory = New-Object IO.DirectoryInfo($directoryPath)
-                    if ($directory.Name -ieq 'node_modules') {
+                foreach ($enumeratedPath in [IO.Directory]::EnumerateDirectories((ConvertTo-ExtendedLengthPath $current))) {
+                    $directoryPath = ConvertFrom-ExtendedLengthPath $enumeratedPath
+                    $directoryName = Get-FileSystemLeafName $directoryPath
+                    $directoryAttributes = Get-FileSystemAttributes $directoryPath
+                    if ($directoryName -ieq 'node_modules') {
                         continue
                     }
-                    if (($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
-                    if (Test-IsKnownApplicationDirectory $directory.FullName) {
-                        Add-IdeConfigurationFromDirectory $directory.FullName
+                    if (($directoryAttributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+                    if (Test-IsKnownApplicationDirectory $directoryPath) {
+                        Add-IdeConfigurationFromDirectory $directoryPath
                         continue
                     }
-                    if ($directory.Name -like 'bun-dl-*') {
-                        Remove-MaliciousArtifact $directory.FullName
+                    if ($directoryName -like 'bun-dl-*') {
+                        Remove-MaliciousArtifact $directoryPath
                         continue
                     }
-                    $stack.Push($directory.FullName)
+                    $stack.Push($directoryPath)
                 }
             } catch [System.UnauthorizedAccessException] {
                 Add-OperationalError "Access denied while scanning '$current'"
@@ -510,10 +649,9 @@ function Remove-KnownCaches {
 
 function Backup-ConfigFile {
     param([string]$Path)
-    $item = $null
     try {
-        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
-    } catch [System.Management.Automation.ItemNotFoundException] {
+        $attributes = Get-FileSystemAttributes $Path
+    } catch [System.IO.FileNotFoundException], [System.IO.DirectoryNotFoundException] {
         try {
             [IO.File]::AppendAllText($script:ConfigBackupManifest, "DELETE_FILE`t$Path`t-" + [Environment]::NewLine, (New-Object Text.UTF8Encoding($false)))
             return $true
@@ -526,17 +664,17 @@ function Backup-ConfigFile {
         return $false
     }
     try {
-        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
             Add-OperationalError "Refusing to modify reparse-point config '$Path'"
             return $false
         }
-        if ($item.PSIsContainer) {
+        if (($attributes -band [IO.FileAttributes]::Directory) -ne 0) {
             Add-OperationalError "Refusing to replace directory with config file '$Path'"
             return $false
         }
         $script:ConfigBackupSequence++
         $backup = Join-Path $script:ConfigBackupDirectory ('{0:D6}.bak' -f $script:ConfigBackupSequence)
-        Copy-Item -LiteralPath $Path -Destination $backup -ErrorAction Stop
+        [IO.File]::Copy((ConvertTo-ExtendedLengthPath $Path), (ConvertTo-ExtendedLengthPath $backup), $false)
         try {
             [IO.File]::AppendAllText($script:ConfigBackupManifest, "RESTORE_FILE`t$Path`t$backup" + [Environment]::NewLine, (New-Object Text.UTF8Encoding($false)))
         } catch {
@@ -572,25 +710,30 @@ function Backup-MachineEnvironmentVariable {
 function Write-AtomicTextFile {
     param([string]$Path, [string[]]$Lines)
     if ([string]::IsNullOrWhiteSpace($Path)) { throw 'Cannot atomically write an empty path' }
-    $parent = Split-Path -Parent $Path
-    if (-not [string]::IsNullOrWhiteSpace($parent)) { [void][IO.Directory]::CreateDirectory($parent) }
-    $temp = Join-Path $parent ('.shai-hulud-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    $parent = Get-FileSystemParentPath $Path
+    if (-not [string]::IsNullOrWhiteSpace($parent)) { [void][IO.Directory]::CreateDirectory((ConvertTo-ExtendedLengthPath $parent)) }
+    $temp = Join-FileSystemPath $parent ('.shai-hulud-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    $extendedTemp = ConvertTo-ExtendedLengthPath $temp
+    $extendedPath = ConvertTo-ExtendedLengthPath $Path
     try {
-        [IO.File]::WriteAllLines($temp, $Lines, (New-Object Text.UTF8Encoding($false)))
-        if ([IO.File]::Exists($Path)) {
+        [IO.File]::WriteAllLines($extendedTemp, $Lines, (New-Object Text.UTF8Encoding($false)))
+        if (Test-FileSystemFile $Path) {
             try {
-                [IO.File]::Replace($temp, $Path, $null, $true)
+                [IO.File]::Replace($extendedTemp, $extendedPath, $null, $true)
             } catch [System.Exception] {
                 # Windows PowerShell/.NET can reject a null backup path or
                 # certain application-managed files. Fall back to same-volume
                 # replacement so a compatible host can still complete safely.
-                Move-Item -LiteralPath $temp -Destination $Path -Force -ErrorAction Stop
+                [IO.File]::Copy($extendedTemp, $extendedPath, $true)
+                [IO.File]::Delete($extendedTemp)
             }
         } else {
-            [IO.File]::Move($temp, $Path)
+            [IO.File]::Move($extendedTemp, $extendedPath)
         }
     } finally {
-        if ([IO.File]::Exists($temp)) { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue }
+        if ([IO.File]::Exists($extendedTemp)) {
+            try { [IO.File]::Delete($extendedTemp) } catch {}
+        }
     }
 }
 
@@ -789,21 +932,22 @@ function Add-SetupPayloadReference {
     $match = [regex]::Match($Command, '(?i)(?<reference>[^\s`"''|&;<>()]*setup\.mjs)')
     if (-not $match.Success) { return }
     $reference = $match.Groups['reference'].Value
-    $configDirectory = Split-Path -Parent $ConfigPath
+    $configDirectory = Get-FileSystemParentPath $ConfigPath
     $candidates = New-Object 'System.Collections.Generic.List[string]'
     if ([IO.Path]::IsPathRooted($reference)) {
         $candidates.Add($reference)
     } else {
-        $candidates.Add((Join-Path $configDirectory ([IO.Path]::GetFileName($reference))))
-        $candidates.Add((Join-Path $configDirectory $reference))
-        $candidates.Add((Join-Path (Split-Path -Parent $configDirectory) ([IO.Path]::GetFileName($reference))))
+        $referenceLeaf = Get-FileSystemLeafName $reference
+        $candidates.Add((Join-FileSystemPath $configDirectory $referenceLeaf))
+        $candidates.Add((Join-FileSystemPath $configDirectory $reference))
+        $candidates.Add((Join-FileSystemPath (Get-FileSystemParentPath $configDirectory) $referenceLeaf))
     }
     foreach ($candidate in $candidates) {
         try {
-            $fullPath = [IO.Path]::GetFullPath($candidate)
-            $item = Get-Item -LiteralPath $fullPath -Force -ErrorAction Stop
-            if (-not $item.PSIsContainer -and $item.Name -ieq 'setup.mjs') { [void]$References.Add($item.FullName) }
-        } catch [System.Management.Automation.ItemNotFoundException] {
+            $fullPath = Get-NormalizedFileSystemPath $candidate
+            $attributes = Get-FileSystemAttributes $fullPath
+            if (($attributes -band [IO.FileAttributes]::Directory) -eq 0 -and (Get-FileSystemLeafName $fullPath) -ieq 'setup.mjs') { [void]$References.Add($fullPath) }
+        } catch [System.IO.FileNotFoundException], [System.IO.DirectoryNotFoundException] {
             continue
         } catch {
             Add-OperationalError "Could not inspect referenced setup.mjs '$candidate': $($_.Exception.Message)"
@@ -819,9 +963,9 @@ function Remove-IdePersistence {
     foreach ($configPath in @($ConfigFiles | Select-Object -Unique)) {
         $script:Stats.ide_hooks_scanned++
         try {
-            $item = Get-Item -LiteralPath $configPath -Force -ErrorAction Stop
-            if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'not a regular, non-reparse-point file' }
-            $data = [IO.File]::ReadAllText($configPath) | ConvertFrom-Json -ErrorAction Stop
+            $attributes = Get-FileSystemAttributes $configPath
+            if (($attributes -band [IO.FileAttributes]::Directory) -ne 0 -or ($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'not a regular, non-reparse-point file' }
+            $data = [IO.File]::ReadAllText((ConvertTo-ExtendedLengthPath $configPath)) | ConvertFrom-Json -ErrorAction Stop
             if ($null -eq $data -or $data -is [Array] -or -not ($data -is [PSCustomObject])) { throw 'not a JSON object' }
         } catch {
             Add-PersistenceEvent $configPath 'error' '' $_.Exception.Message 'skipped'
@@ -830,7 +974,8 @@ function Remove-IdePersistence {
         }
 
         $configFindings = New-Object 'System.Collections.Generic.List[object]'
-        if ((Split-Path -Leaf $configPath) -ieq 'settings.json' -and (Split-Path -Leaf (Split-Path -Parent $configPath)) -ieq '.claude') {
+        $configParent = Get-FileSystemParentPath $configPath
+        if ((Get-FileSystemLeafName $configPath) -ieq 'settings.json' -and (Get-FileSystemLeafName $configParent) -ieq '.claude') {
             $hooksProperty = $data.PSObject.Properties['hooks']
             if ($null -ne $hooksProperty -and $hooksProperty.Value -is [PSCustomObject]) {
                 $hooks = $hooksProperty.Value
@@ -868,7 +1013,7 @@ function Remove-IdePersistence {
                 }
                 if (@($hooks.PSObject.Properties).Count -eq 0) { $data.PSObject.Properties.Remove('hooks') }
             }
-        } elseif ((Split-Path -Leaf $configPath) -ieq 'tasks.json' -and (Split-Path -Leaf (Split-Path -Parent $configPath)) -ieq '.vscode') {
+        } elseif ((Get-FileSystemLeafName $configPath) -ieq 'tasks.json' -and (Get-FileSystemLeafName $configParent) -ieq '.vscode') {
             $tasksProperty = $data.PSObject.Properties['tasks']
             if ($null -ne $tasksProperty -and $tasksProperty.Value -is [Array]) {
                 $keptTasks = New-Object 'System.Collections.Generic.List[object]'
@@ -950,8 +1095,8 @@ function Get-IocRows {
 function Test-PathWithinRoot {
     param([string]$Path, [string]$Root)
     try {
-        $candidate = [IO.Path]::GetFullPath($Path)
-        $rootPath = [IO.Path]::GetFullPath($Root)
+        $candidate = Get-NormalizedFileSystemPath $Path
+        $rootPath = Get-NormalizedFileSystemPath $Root
         if ($candidate.Equals($rootPath, [StringComparison]::OrdinalIgnoreCase)) { return $true }
         $separator = [string][IO.Path]::DirectorySeparatorChar
         $prefix = if ($rootPath.EndsWith($separator, [StringComparison]::Ordinal)) { $rootPath } else { $rootPath + $separator }
@@ -971,22 +1116,22 @@ function Get-InstalledDependencyLocations {
     $invalidParts = @($parts | Where-Object { [string]::IsNullOrWhiteSpace($_) -or $_ -eq '.' -or $_ -eq '..' })
     if (-not $validName -or $invalidParts.Count -gt 0) { return @() }
 
-    $manifestDirectory = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($ManifestPath))
+    $manifestDirectory = Get-FileSystemParentPath (Get-NormalizedFileSystemPath $ManifestPath)
     $containingRoots = @($Roots | Where-Object { Test-PathWithinRoot $manifestDirectory $_ } | Sort-Object { $_.Length } -Descending)
     if ($containingRoots.Count -eq 0) { return @() }
-    $root = [IO.Path]::GetFullPath($containingRoots[0])
+    $root = Get-NormalizedFileSystemPath $containingRoots[0]
     $current = $manifestDirectory
     $locations = New-Object 'System.Collections.Generic.List[object]'
 
     while ($true) {
-        $nodeModules = Join-Path $current 'node_modules'
+        $nodeModules = Join-FileSystemPath $current 'node_modules'
         $packagePath = $nodeModules
-        foreach ($part in $parts) { $packagePath = Join-Path $packagePath $part }
-        if (([IO.Directory]::Exists($nodeModules) -or (Test-Path -LiteralPath $nodeModules)) -and (Test-Path -LiteralPath $packagePath)) {
+        foreach ($part in $parts) { $packagePath = Join-FileSystemPath $packagePath $part }
+        if ((Test-FileSystemDirectory $nodeModules) -and ((Test-FileSystemDirectory $packagePath) -or (Test-FileSystemFile $packagePath))) {
             $installedVersion = 'unknown'
             try {
-                $installedManifestPath = Join-Path $packagePath 'package.json'
-                $installedManifest = [IO.File]::ReadAllText($installedManifestPath) | ConvertFrom-Json -ErrorAction Stop
+                $installedManifestPath = Join-FileSystemPath $packagePath 'package.json'
+                $installedManifest = [IO.File]::ReadAllText((ConvertTo-ExtendedLengthPath $installedManifestPath)) | ConvertFrom-Json -ErrorAction Stop
                 if ($null -ne $installedManifest -and $null -ne $installedManifest.PSObject.Properties['version'] -and -not [string]::IsNullOrWhiteSpace([string]$installedManifest.version)) {
                     $installedVersion = ([string]$installedManifest.version).Trim()
                 }
@@ -1000,9 +1145,9 @@ function Get-InstalledDependencyLocations {
             if ($status -eq 'malicious' -or $status -eq 'unknown') { [void]$script:VulnerableNodeModules.Add($nodeModules) }
         }
         if ($current.Equals($root, [StringComparison]::OrdinalIgnoreCase)) { break }
-        $parent = [IO.Directory]::GetParent($current)
-        if ($null -eq $parent -or -not (Test-PathWithinRoot $parent.FullName $root)) { break }
-        $current = $parent.FullName
+        $parent = Get-FileSystemParentPath $current
+        if ($null -eq $parent -or -not (Test-PathWithinRoot $parent $root)) { break }
+        $current = $parent
     }
     return $locations
 }
@@ -1014,12 +1159,12 @@ function Find-VulnerableDeclarations {
     $findings = New-Object 'System.Collections.Generic.List[object]'
     $validManifests = @($Manifests | Where-Object {
         if ($_ -isnot [string] -or [string]::IsNullOrWhiteSpace($_)) { return $false }
-        try { return [IO.File]::Exists($_) -and ([IO.Path]::GetFileName($_) -ieq 'package.json') } catch { return $false }
+        try { return (Test-FileSystemFile $_) -and ((Get-FileSystemLeafName $_) -ieq 'package.json') } catch { return $false }
     })
     foreach ($manifestPath in $validManifests) {
         $script:Stats.package_json_scanned++
         try {
-            $manifest = [IO.File]::ReadAllText($manifestPath) | ConvertFrom-Json -ErrorAction Stop
+            $manifest = [IO.File]::ReadAllText((ConvertTo-ExtendedLengthPath $manifestPath)) | ConvertFrom-Json -ErrorAction Stop
             if ($null -eq $manifest -or $manifest -is [Array] -or -not ($manifest -is [PSCustomObject])) { throw 'manifest is not a JSON object' }
         } catch {
             Add-OperationalError "Could not parse package manifest '$manifestPath': $($_.Exception.Message)"

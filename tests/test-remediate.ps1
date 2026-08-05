@@ -16,6 +16,12 @@ function Assert-True {
     if (-not $Condition) { throw "Assertion failed: $Message" }
 }
 
+function ConvertTo-TestExtendedPath {
+    param([string]$Path)
+    if ($Path.StartsWith('\\', [StringComparison]::Ordinal)) { return '\\?\UNC\' + $Path.Substring(2) }
+    return '\\?\' + $Path
+}
+
 function Invoke-TestRemediation {
     param(
         [string]$ScanRoot,
@@ -53,11 +59,23 @@ try {
     [void][IO.Directory]::CreateDirectory((Join-Path $project 'subproject\node_modules\safe-package\node_modules\bad-package'))
     [IO.File]::WriteAllText((Join-Path $project 'subproject\node_modules\safe-package\node_modules\bad-package\package.json'), '{"name":"bad-package","version":"1.2.3"}')
 
+    # Windows PowerShell 5.1 must traverse and remediate paths beyond the
+    # legacy MAX_PATH boundary without requiring the machine policy toggle.
+    $longProject = $project
+    foreach ($index in 1..8) { $longProject += ('\long-path-segment-{0:D2}-abcdefghij' -f $index) }
+    Assert-True ($longProject.Length -gt 260) 'long-path regression fixture did not exceed MAX_PATH'
+    $longNodeModules = $longProject + '\node_modules'
+    $longPackageDirectory = $longNodeModules + '\bad-package'
+    [void][IO.Directory]::CreateDirectory((ConvertTo-TestExtendedPath $longPackageDirectory))
+    [IO.File]::WriteAllText((ConvertTo-TestExtendedPath ($longProject + '\package.json')), '{"dependencies":{"bad-package":"1.2.3"}}')
+    [IO.File]::WriteAllText((ConvertTo-TestExtendedPath ($longPackageDirectory + '\package.json')), '{"name":"bad-package","version":"1.2.3"}')
+
     $firstReports = Join-Path $RunDirectory 'reports'
     $firstBackups = Join-Path $RunDirectory 'backups'
     $firstExit = Invoke-TestRemediation $project $firstReports $firstBackups
     Assert-True ($firstExit -eq 10) "first remediation exit was $firstExit"
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $project 'node_modules'))) 'node_modules was not removed'
+    Assert-True (-not [IO.Directory]::Exists((ConvertTo-TestExtendedPath $longNodeModules))) 'long-path node_modules was not removed'
     Assert-True (Test-Path -LiteralPath (Join-Path $project '.yarn\cache\archive')) 'unrelated project Yarn cache was removed'
     Assert-True (Test-Path -LiteralPath (Join-Path $project 'AppData\Local\ExcludedApp\node_modules\bad-package')) 'excluded application dependency tree was removed'
     Assert-True (Test-Path -LiteralPath (Join-Path $project 'AppData\Local\ExcludedApp\Math_Symbol.js')) 'incident-like file inside an excluded application directory was removed'
@@ -80,18 +98,20 @@ try {
     Assert-True ($firstSummary.operational_errors -eq 0) 'unexpected operational errors in first remediation'
     Assert-True ($firstLogText -notmatch "Could not parse package manifest '.*Scanning filesystem") 'log output contaminated manifest scanning'
     Assert-True ($firstLogText -notmatch "config ''") 'empty configuration path was processed'
-    Assert-True ($firstSummary.node_modules_removed -eq 1) 'node_modules counter is incorrect'
+    Assert-True ($firstSummary.node_modules_removed -eq 2) 'node_modules counter is incorrect'
     Assert-True ($firstSummary.caches_removed -eq 0) 'cache counter is incorrect'
     Assert-True ($firstSummary.configs_updated -eq 0) 'config counter is incorrect'
-    Assert-True ($firstSummary.dependency_findings -eq 2) 'dependency counter is incorrect'
+    Assert-True ($firstSummary.package_json_scanned -eq 3) 'long-path manifest was not scanned'
+    Assert-True ($firstSummary.dependency_findings -eq 3) 'dependency counter is incorrect'
     Assert-True ($firstSummary.ide_hooks_removed -eq 2) 'IDE hook counter is incorrect'
     Assert-True ($firstSummary.persistence_artifacts_removed -eq 2) 'persistence artifact counter is incorrect'
 
     $nodeModulesCsv = @(Get-ChildItem -LiteralPath $firstReports -Filter '*NodeModules*.csv')[0]
     $nodeModulesRows = @(Import-Csv -LiteralPath $nodeModulesCsv.FullName)
-    Assert-True (@($nodeModulesRows | Where-Object { $_.Action -eq 'removed' }).Count -eq 1) 'node_modules removal report row is missing'
+    Assert-True (@($nodeModulesRows | Where-Object { $_.Action -eq 'removed' }).Count -eq 2) 'node_modules removal report row is missing'
+    Assert-True (@($nodeModulesRows | Where-Object { $_.'Node Modules' -eq $longNodeModules -and $_.Action -eq 'removed' }).Count -eq 1) 'long-path removal report row is missing'
     $dependencyRows = @(Import-Csv -LiteralPath (@(Get-ChildItem -LiteralPath $firstReports -Filter '*Dependencies*.csv')[0].FullName))
-    Assert-True (@($dependencyRows | Where-Object { $_.Package -eq 'bad-package' -and $_.'Installed Status' -eq 'malicious' }).Count -eq 1) 'malicious installed dependency status is missing'
+    Assert-True (@($dependencyRows | Where-Object { $_.Package -eq 'bad-package' -and $_.'Installed Status' -eq 'malicious' }).Count -eq 2) 'malicious installed dependency status is missing'
     Assert-True (@($dependencyRows | Where-Object { $_.Manifest -like '*AppData*ExcludedApp*' }).Count -eq 0) 'excluded application manifest was scanned'
 
     foreach ($configName in @('.npmrc','.yarnrc','.yarnrc.yml','.bunfig.toml','pnpm-workspace.yaml')) {
@@ -185,5 +205,8 @@ try {
 
     Write-Output 'Remediate-ShaiHulud.ps1 tests passed'
 } finally {
-    if ([IO.Directory]::Exists($RunDirectory)) { Remove-Item -LiteralPath $RunDirectory -Recurse -Force -ErrorAction SilentlyContinue }
+    if ([IO.Directory]::Exists($RunDirectory)) {
+        try { [IO.Directory]::Delete((ConvertTo-TestExtendedPath $RunDirectory), $true) }
+        catch { Remove-Item -LiteralPath $RunDirectory -Recurse -Force -ErrorAction SilentlyContinue }
+    }
 }

@@ -6,7 +6,7 @@ set -u
 set -o pipefail
 umask 077
 
-VERSION="3.1.4"
+VERSION="3.1.5"
 IOC_URL="https://raw.githubusercontent.com/wiz-sec-public/wiz-research-iocs/refs/heads/main/reports/keyv-packages.csv"
 MODE="remediate"
 IOC_FILE=""

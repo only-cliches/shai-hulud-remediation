@@ -28,7 +28,7 @@ try {
     [System.AppContext]::SetSwitch('Switch.System.IO.UseLegacyPathHandling', $false)
     [System.AppContext]::SetSwitch('Switch.System.IO.BlockLongPaths', $false)
 } catch {}
-$ToolVersion = '3.1.4'
+$ToolVersion = '3.1.5'
 $IocUrl = 'https://raw.githubusercontent.com/wiz-sec-public/wiz-research-iocs/refs/heads/main/reports/keyv-packages.csv'
 $Mode = if ($AuditOnly) { 'audit' } else { 'remediate' }
 if ($null -eq $ScanRoot) {
@@ -303,15 +303,40 @@ if ($UsingDefaultReportDirectory) {
     # Keep reports in a predictable, operator-accessible Windows location for
     # both interactive and SYSTEM/RMM executions. Do not use C:\Users itself:
     # Set-PrivateDirectoryAcl must only apply to this dedicated subdirectory.
-    $ReportDirectory = 'C:\Users\Public\Shai-Hulud-Remediation'
-}
-try {
-    [void][IO.Directory]::CreateDirectory($ReportDirectory)
-    if (-not (Test-IsSafeDirectoryPath $ReportDirectory)) { throw 'Report directory is a reparse point' }
-    if ($UsingDefaultReportDirectory) { Set-PrivateDirectoryAcl $ReportDirectory $IsAdministrator }
-} catch {
-    Write-Error "Cannot create report directory '$ReportDirectory': $($_.Exception.Message)"
-    exit 30
+    $preferredReportDirectory = 'C:\Users\Public\Shai-Hulud-Remediation'
+    $fallbackStateRoot = if (-not [string]::IsNullOrWhiteSpace($env:ProgramData)) { $env:ProgramData } else { 'C:\ProgramData' }
+    $fallbackReportDirectory = Join-Path $fallbackStateRoot 'Shai-Hulud-Remediation'
+    $reportDirectoryErrors = New-Object 'System.Collections.Generic.List[string]'
+    $ReportDirectory = $null
+    foreach ($candidate in @($preferredReportDirectory, $fallbackReportDirectory)) {
+        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+        if ($null -ne $ReportDirectory) { break }
+        try {
+            if ([IO.File]::Exists($candidate)) { throw 'Path exists as a file' }
+            [void][IO.Directory]::CreateDirectory($candidate)
+            if (-not (Test-IsSafeDirectoryPath $candidate)) { throw 'Directory is a reparse point or is not safely accessible' }
+            Set-PrivateDirectoryAcl $candidate $IsAdministrator
+            $ReportDirectory = $candidate
+        } catch {
+            $reportDirectoryErrors.Add("'$candidate': $($_.Exception.Message)")
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($ReportDirectory)) {
+        Write-Error "Cannot create a safe default report directory. $([string]::Join('; ', $reportDirectoryErrors.ToArray()))"
+        exit 30
+    }
+    if (-not $ReportDirectory.Equals($preferredReportDirectory, [StringComparison]::OrdinalIgnoreCase)) {
+        Write-Warning "Preferred report directory '$preferredReportDirectory' is unavailable. Using fallback report directory '$ReportDirectory'."
+    }
+} else {
+    try {
+        if ([IO.File]::Exists($ReportDirectory)) { throw 'Path exists as a file' }
+        [void][IO.Directory]::CreateDirectory($ReportDirectory)
+        if (-not (Test-IsSafeDirectoryPath $ReportDirectory)) { throw 'Directory is a reparse point or is not safely accessible' }
+    } catch {
+        Write-Error "Cannot create report directory '$ReportDirectory': $($_.Exception.Message)"
+        exit 30
+    }
 }
 
 $RunId = '{0}-{1}' -f ([DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ')), $PID
@@ -1417,6 +1442,8 @@ $summary = [ordered]@{
     mode = $Mode
     status = $Status
     exit_code = $ExitCode
+    report_directory = $ReportDirectory
+    log_file = $ReportFile
 }
 foreach ($entry in $Stats.GetEnumerator()) { $summary[$entry.Key] = $entry.Value }
 try {

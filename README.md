@@ -110,9 +110,9 @@ Default report and backup locations are:
 | --- | --- | --- | --- |
 | Linux | `/var/log/Shai-Hulud-Remediation` | `$HOME/.local/state/Shai-Hulud-Remediation` | `/var/lib/Shai-Hulud-Remediation/Backups/<run-id>` |
 | macOS | `/Library/Logs/Shai-Hulud-Remediation` | `$HOME/.local/state/Shai-Hulud-Remediation` | `/Library/Application Support/Shai-Hulud-Remediation/Backups/<run-id>` |
-| Windows | `C:\Users\Public\Shai-Hulud-Remediation` | `C:\Users\Public\Shai-Hulud-Remediation` | `%ProgramData%\Shai-Hulud-Remediation\Backups\<run-id>` |
+| Windows | `C:\Users\Public\Shai-Hulud-Remediation` (fallback: `%ProgramData%\Shai-Hulud-Remediation`) | `C:\Users\Public\Shai-Hulud-Remediation` (fallback: `%ProgramData%\Shai-Hulud-Remediation`) | `%ProgramData%\Shai-Hulud-Remediation\Backups\<run-id>` |
 
-If a non-elevated Unix run cannot use `$HOME`, it allocates a private temporary report directory and prints the path. Override locations with `--report-dir` / `-ReportDirectory` and `--backup-dir` / `-BackupDirectory`. Backup directories are created with restrictive permissions or ACLs even when their parent was supplied by the operator.
+If a non-elevated Unix run cannot use `$HOME`, it allocates a private temporary report directory and prints the path. On Windows, if the default public report directory cannot be safely created, is inaccessible, or is a reparse point, the script automatically uses `%ProgramData%\Shai-Hulud-Remediation` and prints a warning containing the selected path. An explicitly supplied `-ReportDirectory` remains strict and does not fall back. Override locations with `--report-dir` / `-ReportDirectory` and `--backup-dir` / `-BackupDirectory`. Backup directories are created with restrictive permissions or ACLs even when their parent was supplied by the operator.
 
 Each run writes:
 
